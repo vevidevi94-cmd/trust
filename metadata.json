@@ -1,0 +1,6 @@
+{
+  "name": "TrustedPanel 👑",
+  "description": "TrustedPanel social media growth services for Instagram, Facebook, Telegram, and YouTube with instant UPI wallet funding and order tracking.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,61 @@
+@import "tailwindcss";
+
+* {
+  box-sizing: border-box;
+  font-family: 'Poppins', sans-serif;
+  -webkit-tap-highlight-color: transparent;
+}
+
+body {
+  margin: 0;
+  background: #d8c7f5;
+  min-height: 100vh;
+  color: #2d1b4e;
+}
+
+@keyframes shine {
+  0% {
+    background-position: 0% 50%;
+  }
+  100% {
+    background-position: 200% 50%;
+  }
+}
+
+@keyframes pulseOffer {
+  0% {
+    transform: scale(1);
+  }
+  100% {
+    transform: scale(1.08);
+  }
+}
+
+@keyframes waPop {
+  from {
+    transform: scale(0.85);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+.offer-badge-anim {
+  background: linear-gradient(90deg, #ff0000, #ff6a00, #ffd600, #ff0000);
+  background-size: 300% 100%;
+  animation: shine 1.8s linear infinite, pulseOffer 1s ease-in-out infinite alternate;
+  box-shadow: 0 0 15px rgba(255, 0, 0, 0.6);
+}
+
+.modal-pop-anim {
+  animation: waPop 0.15s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .offer-badge-anim,
+  .modal-pop-anim {
+    animation: none;
+  }
+}
