@@ -1,14 +1,14 @@
 import React from 'react';
-import type { OrderItem, UtrFundRequest } from '../data/services';
-import { getOrderStatusBadgeStyle, getUtrStatusBadgeStyle } from '../utils/panelLogic';
+import type { OrderItem, PaymentFundRequest } from '../data/services';
+import { getOrderStatusBadgeStyle, getPaymentStatusBadgeStyle } from '../utils/panelLogic';
 
 interface OrdersViewProps {
   orders: OrderItem[];
-  utrRequests: UtrFundRequest[];
+  paymentRequests: PaymentFundRequest[];
 }
 
-export function OrdersView({ orders, utrRequests }: OrdersViewProps) {
-  const latestUtr = utrRequests[0] ?? null;
+export function OrdersView({ orders, paymentRequests }: OrdersViewProps) {
+  const latestPayment = paymentRequests[0] ?? null;
 
   return (
     <section aria-labelledby="my-orders-heading">
@@ -19,14 +19,14 @@ export function OrdersView({ orders, utrRequests }: OrdersViewProps) {
         My Orders
       </h1>
 
-      {latestUtr && (
+      {latestPayment && (
         <div className="bg-white rounded-[16px] p-[12px] mb-3 shadow-[0_4px_12px_rgba(60,20,120,0.06)] border border-[#e9dffc]">
           <div className="flex justify-between items-center gap-2">
             <span className="text-[12px] font-bold text-[#3a1d6d]">
-              Latest Payment • UTR: <span className="text-[#7c4dff]">{latestUtr.utr}</span>
+              Latest Payment • ₹{latestPayment.amount.toFixed(2)} ({latestPayment.app})
             </span>
             {(() => {
-              const badge = getUtrStatusBadgeStyle(latestUtr.status);
+              const badge = getPaymentStatusBadgeStyle(latestPayment.status);
               return (
                 <span
                   style={{ backgroundColor: badge.bg, color: badge.color }}
@@ -37,13 +37,13 @@ export function OrdersView({ orders, utrRequests }: OrdersViewProps) {
               );
             })()}
           </div>
-          {latestUtr.adminMessage && (
+          {latestPayment.adminMessage && (
             <div
               className={`text-[12px] font-semibold mt-1 ${
-                latestUtr.status === 'wrong_payment' ? 'text-[#c62828]' : 'text-[#2e7d32]'
+                latestPayment.status === 'wrong_payment' ? 'text-[#c62828]' : 'text-[#2e7d32]'
               }`}
             >
-              {latestUtr.adminMessage}
+              {latestPayment.adminMessage}
             </div>
           )}
         </div>
@@ -79,9 +79,9 @@ export function OrdersView({ orders, utrRequests }: OrdersViewProps) {
                 <div className="text-[12px] text-[#7c4dff] break-all mt-0.5">
                   {order.link}
                 </div>
-                {order.utr && (
-                  <div className="text-[11px] font-bold text-[#3a1d6d] mt-0.5">
-                    UTR: {order.utr}
+                {(order.hasPaymentScreenshot || order.paymentId) && (
+                  <div className="text-[11px] font-bold text-[#2e7d32] mt-0.5">
+                    Payment Screenshot Verified ✅
                   </div>
                 )}
                 <div className="text-[11px] text-[#666666] mt-0.5 tabular-nums">

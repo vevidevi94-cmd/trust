@@ -5,7 +5,11 @@ import { PlatformIcon } from './BrandIcons';
 interface PricesViewProps {
   service: ServiceItem;
   onBack: () => void;
-  onPlaceOrder: (params: { link: string; selectedPrice: PriceTier | null }) => Promise<boolean> | boolean;
+  onPlaceOrder: (params: {
+    link: string;
+    selectedPrice: PriceTier | null;
+    packIndex: number | null;
+  }) => Promise<boolean> | boolean;
 }
 
 export function PricesView({ service, onBack, onPlaceOrder }: PricesViewProps) {
@@ -16,7 +20,11 @@ export function PricesView({ service, onBack, onPlaceOrder }: PricesViewProps) {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    const placed = await onPlaceOrder({ link: linkInput, selectedPrice });
+    const placed = await onPlaceOrder({
+      link: linkInput,
+      selectedPrice,
+      packIndex: selectedIdx,
+    });
     if (placed) {
       setLinkInput('');
     }

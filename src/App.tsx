@@ -1,24 +1,19 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  ADMIN_PASSWORD,
   CATEGORIES,
   SERVICE_CATALOG,
   type CategoryKey,
   type OrderItem,
+  type PaymentFundRequest,
   type PriceTier,
   type ServiceItem,
   type SupportMessage,
-  type UtrFundRequest,
 } from './data/services';
 import {
   applyOrderDeduction,
-  createOrderRecord,
-  detectNewPendingUtrIds,
-  formatBalance,
-  generateUserId,
+  detectNewPendingPaymentIds,
   parseHashPage,
   validateOrderPlacement,
-  verifyAdminPassword,
   type ActivePage,
 } from './utils/panelLogic';
 import {
@@ -33,7 +28,7 @@ import { HomeView } from './components/HomeView';
 import { ServicesView } from './components/ServicesView';
 import { PricesView } from './components/PricesView';
 import { OrdersView } from './components/OrdersView';
-import { FundView } from './components/FundView';
+import { FundView, type CheckoutSessionState } from './components/FundView';
 import { MenuView } from './components/MenuView';
 import { AdminView } from './components/AdminView';
 import { SupportModal } from './components/SupportModal';
@@ -45,46 +40,6 @@ interface NavHistoryState {
   cat: CategoryKey;
   serviceId: string | null;
   modal: ModalKind;
-  checkoutAmt?: number | null;
-}
-
-function getInitialUid(): string {
-  try {
-    const saved = localStorage.getItem('tp_uid');
-    if (saved && saved !== 'TRUST-0000') return saved;
-    const created = generateUserId();
-    localStorage.setItem('tp_uid', created);
-    return created;
-  } catch {
-    return generateUserId();
-  }
-}
-
-function getInitialBalance(): number {
-  try {
-    const raw = parseFloat(localStorage.getItem('tp_bal') || '0');
-    return Number.isFinite(raw) ? raw : 0;
-  } catch {
-    return 0;
-  }
-}
-
-function getInitialOrders(): OrderItem[] {
-  try {
-    const parsed = JSON.parse(localStorage.getItem('tp_orders') || '[]');
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-function getInitialCounter(): number {
-  try {
-    const parsed = parseInt(localStorage.getItem('tp_cnt') || '1', 10);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
-  } catch {
-    return 1;
-  }
 }
 
 function getInitialSupportMessages(): SupportMessage[] {
@@ -96,43 +51,33 @@ function getInitialSupportMessages(): SupportMessage[] {
   }
 }
 
-function getInitialAdminAuth(): boolean {
-  try {
-    return localStorage.getItem('tp_admin_pass') === ADMIN_PASSWORD;
-  } catch {
-    return false;
-  }
-}
-
 function findServiceById(cat: CategoryKey, serviceId: string | null): ServiceItem | null {
   if (!serviceId) return null;
   return SERVICE_CATALOG[cat]?.find((s) => s.id === serviceId) ?? null;
 }
 
 export default function App() {
-  const [uid] = useState<string>(getInitialUid);
-  const [balance, setBalance] = useState<number>(getInitialBalance);
-  const [orders, setOrders] = useState<OrderItem[]>(getInitialOrders);
-  const [utrRequests, setUtrRequests] = useState<UtrFundRequest[]>([]);
-  const [counter, setCounter] = useState<number>(getInitialCounter);
+  const [uid, setUid] = useState<string>('TRUST-...');
+  const [balance, setBalance] = useState<number>(0);
+  const [orders, setOrders] = useState<OrderItem[]>([]);
+  const [paymentRequests, setPaymentRequests] = useState<PaymentFundRequest[]>([]);
   const [supportMessages, setSupportMessages] = useState<SupportMessage[]>(
     getInitialSupportMessages,
   );
 
-  const [isAdminLoggedIn, setIsAdminLoggedIn] = useState<boolean>(getInitialAdminAuth);
-  const [adminUtrRequests, setAdminUtrRequests] = useState<UtrFundRequest[]>([]);
+  const [isAdminLoggedIn, setIsAdminLoggedIn] = useState<boolean>(false);
+  const [adminPaymentRequests, setAdminPaymentRequests] = useState<PaymentFundRequest[]>([]);
   const [adminOrders, setAdminOrders] = useState<OrderItem[]>([]);
 
   const [activePage, setActivePage] = useState<ActivePage>(() => {
     const parsed = parseHashPage(window.location.hash);
-    if (parsed === 'admin' && !getInitialAdminAuth()) return 'menu';
-    return parsed;
+    return parsed === 'admin' ? 'menu' : parsed;
   });
   const [currentCategory, setCurrentCategory] = useState<CategoryKey>('instagram');
   const [currentService, setCurrentService] = useState<ServiceItem | null>(null);
 
   const [supportOpen, setSupportOpen] = useState(false);
-  const [checkoutAmount, setCheckoutAmount] = useState<number | null>(null);
+  const [checkoutSession, setCheckoutSession] = useState<CheckoutSessionState | null>(null);
   const [adminLoginOpen, setAdminLoginOpen] = useState(false);
 
   const [toastState, setToastState] = useState<{
@@ -146,7 +91,7 @@ export default function App() {
   });
 
   const toastTimerRef = useRef<number | null>(null);
-  const prevUtrStatusRef = useRef<Map<string, string>>(new Map());
+  const prevPaymentStatusRef = useRef<Map<string, string>>(new Map());
   const knownAdminPendingIdsRef = useRef<Set<string> | null>(null);
   const historyDepthRef = useRef<number>(0);
 
@@ -160,29 +105,39 @@ export default function App() {
     }, 4000);
   }, []);
 
-  // Persist user-local caches
+  // Only persist non-sensitive support chat history locally
   useEffect(() => {
     try {
-      localStorage.setItem('tp_bal', String(balance));
-      localStorage.setItem('tp_orders', JSON.stringify(orders));
-      localStorage.setItem('tp_cnt', String(counter));
       localStorage.setItem('tp_support_msgs', JSON.stringify(supportMessages));
     } catch {
       // Ignore storage quota errors
     }
-  }, [balance, orders, counter, supportMessages]);
+  }, [supportMessages]);
+
+  // Verify admin HttpOnly cookie session on mount (no secret stored in browser storage)
+  useEffect(() => {
+    fetch('/api/admin/session', { credentials: 'same-origin' })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: { ok?: boolean; authenticated?: boolean } | null) => {
+        if (data?.ok && data.authenticated) {
+          setIsAdminLoggedIn(true);
+          if (parseHashPage(window.location.hash) === 'admin') {
+            setActivePage('admin');
+          }
+        }
+      })
+      .catch(() => {});
+  }, []);
 
   // Initialize history state cleanly on mount so phone Back moves exactly 1 step per press
   useEffect(() => {
     const initialPage = parseHashPage(window.location.hash);
-    const resolvedPage: ActivePage =
-      initialPage === 'admin' && !getInitialAdminAuth() ? 'menu' : initialPage;
+    const resolvedPage: ActivePage = initialPage === 'admin' ? 'menu' : initialPage;
     const initialState: NavHistoryState = {
       page: resolvedPage,
       cat: 'instagram',
       serviceId: null,
       modal: null,
-      checkoutAmt: null,
     };
     try {
       window.history.replaceState(initialState, '', `#${resolvedPage}`);
@@ -205,14 +160,15 @@ export default function App() {
         setActivePage(targetPage);
         setSupportOpen(st.modal === 'support');
         setAdminLoginOpen(st.modal === 'admin-login');
-        setCheckoutAmount(st.modal === 'checkout' ? (st.checkoutAmt ?? null) : null);
+        if (st.modal !== 'checkout') {
+          setCheckoutSession(null);
+        }
         return;
       }
 
-      // Fallback when browser pops without custom state
       setSupportOpen(false);
       setAdminLoginOpen(false);
-      setCheckoutAmount(null);
+      setCheckoutSession(null);
       const hashPage = parseHashPage(window.location.hash);
       setActivePage(hashPage === 'admin' && !isAdminLoggedIn ? 'menu' : hashPage);
     };
@@ -228,7 +184,9 @@ export default function App() {
       setCurrentService(findServiceById(next.cat, next.serviceId));
       setSupportOpen(next.modal === 'support');
       setAdminLoginOpen(next.modal === 'admin-login');
-      setCheckoutAmount(next.modal === 'checkout' ? (next.checkoutAmt ?? null) : null);
+      if (next.modal !== 'checkout') {
+        setCheckoutSession(null);
+      }
 
       const hash = hashOverride ?? next.page;
       historyDepthRef.current += 1;
@@ -254,7 +212,6 @@ export default function App() {
           cat: currentCategory,
           serviceId: null,
           modal: null,
-          checkoutAmt: null,
         },
         fallbackPage,
       );
@@ -262,44 +219,50 @@ export default function App() {
     [currentCategory, pushNavState],
   );
 
-  // Sync user's live balance, UTR statuses, and order statuses from server
+  // Sync user's live authoritative balance, payment statuses, and orders via HttpOnly session cookie
   const syncUserState = useCallback(async () => {
     try {
-      const res = await fetch(`/api/user-state/${encodeURIComponent(uid)}`);
+      const res = await fetch('/api/user-state', {
+        credentials: 'same-origin',
+        cache: 'no-store',
+      });
       if (!res.ok) return;
       const data = (await res.json()) as {
         ok?: boolean;
+        uid?: string;
         balance?: number;
-        utrRequests?: UtrFundRequest[];
+        paymentRequests?: PaymentFundRequest[];
         orders?: OrderItem[];
       };
       if (!data.ok) return;
 
+      if (data.uid) {
+        setUid(data.uid);
+      }
       if (typeof data.balance === 'number') {
         setBalance(data.balance);
       }
 
-      if (Array.isArray(data.utrRequests)) {
-        // Detect transitions from pending -> approved or wrong_payment
-        for (const req of data.utrRequests) {
-          const prev = prevUtrStatusRef.current.get(req.id);
+      if (Array.isArray(data.paymentRequests)) {
+        for (const req of data.paymentRequests) {
+          const prev = prevPaymentStatusRef.current.get(req.id);
           if (prev === 'pending' && req.status === 'approved') {
             showToast(`₹${req.amount.toFixed(2)} Fund Added to Wallet ✅`);
           } else if (prev === 'pending' && req.status === 'wrong_payment') {
-            showToast(req.adminMessage || 'Wrong Payment / Invalid UTR ❌', true);
+            showToast(req.adminMessage || 'Wrong Payment / Invalid Screenshot ❌', true);
           }
-          prevUtrStatusRef.current.set(req.id, req.status);
+          prevPaymentStatusRef.current.set(req.id, req.status);
         }
-        setUtrRequests(data.utrRequests);
+        setPaymentRequests(data.paymentRequests);
       }
 
-      if (Array.isArray(data.orders) && data.orders.length > 0) {
+      if (Array.isArray(data.orders)) {
         setOrders(data.orders);
       }
     } catch {
       // Ignore transient network errors during poll
     }
-  }, [showToast, uid]);
+  }, [showToast]);
 
   useEffect(() => {
     void syncUserState();
@@ -309,46 +272,51 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [syncUserState]);
 
-  // Sync Admin overview + trigger 3-second iPhone notification when a new UTR arrives in Admin mode
+  // Sync Admin overview + trigger 3-second iPhone notification when a new Payment Screenshot arrives
   const syncAdminOverview = useCallback(
     async (isInitialPoll = false) => {
       if (!isAdminLoggedIn) return;
       try {
         const res = await fetch('/api/admin/overview', {
-          headers: { 'x-admin-pass': ADMIN_PASSWORD },
+          credentials: 'same-origin',
+          cache: 'no-store',
         });
+        if (res.status === 401) {
+          setIsAdminLoggedIn(false);
+          return;
+        }
         if (!res.ok) return;
         const data = (await res.json()) as {
           ok?: boolean;
-          utrRequests?: UtrFundRequest[];
+          paymentRequests?: PaymentFundRequest[];
           orders?: OrderItem[];
         };
         if (!data.ok) return;
 
-        const incomingUtrs = Array.isArray(data.utrRequests) ? data.utrRequests : [];
+        const incomingPayments = Array.isArray(data.paymentRequests) ? data.paymentRequests : [];
         const incomingOrders = Array.isArray(data.orders) ? data.orders : [];
 
         if (knownAdminPendingIdsRef.current === null || isInitialPoll) {
           knownAdminPendingIdsRef.current = new Set(
-            incomingUtrs.filter((r) => r.status === 'pending').map((r) => r.id),
+            incomingPayments.filter((r) => r.status === 'pending').map((r) => r.id),
           );
         } else {
-          const newIds = detectNewPendingUtrIds(knownAdminPendingIdsRef.current, incomingUtrs);
+          const newIds = detectNewPendingPaymentIds(knownAdminPendingIdsRef.current, incomingPayments);
           if (newIds.length > 0) {
             for (const id of newIds) {
               knownAdminPendingIdsRef.current.add(id);
             }
-            const newest = incomingUtrs.find((r) => r.id === newIds[0]);
+            const newest = incomingPayments.find((r) => r.id === newIds[0]);
             playIphoneNotification3Sec();
             showToast(
               newest
-                ? `🔔 New UTR ₹${newest.amount.toFixed(0)} from ${newest.uid}`
-                : '🔔 New UTR Payment Request Received!',
+                ? `🔔 New Payment Screenshot ₹${newest.amount.toFixed(0)} from ${newest.uid}`
+                : '🔔 New Payment Screenshot Received!',
             );
           }
         }
 
-        setAdminUtrRequests(incomingUtrs);
+        setAdminPaymentRequests(incomingPayments);
         setAdminOrders(incomingOrders);
       } catch {
         // Ignore transient poll errors
@@ -377,7 +345,6 @@ export default function App() {
       cat: currentCategory,
       serviceId: null,
       modal: null,
-      checkoutAmt: null,
     });
   }, [currentCategory, pushNavState]);
 
@@ -389,7 +356,6 @@ export default function App() {
         cat,
         serviceId: null,
         modal: null,
-        checkoutAmt: null,
       });
     },
     [pushNavState],
@@ -403,7 +369,6 @@ export default function App() {
         cat: currentCategory,
         serviceId: service.id,
         modal: null,
-        checkoutAmt: null,
       });
     },
     [currentCategory, pushNavState],
@@ -417,7 +382,6 @@ export default function App() {
       cat: 'instagram',
       serviceId: reelsOffer.id,
       modal: null,
-      checkoutAmt: null,
     });
   }, [pushNavState]);
 
@@ -428,7 +392,6 @@ export default function App() {
       cat: currentCategory,
       serviceId: null,
       modal: null,
-      checkoutAmt: null,
     });
   }, [currentCategory, pushNavState]);
 
@@ -439,7 +402,6 @@ export default function App() {
       cat: currentCategory,
       serviceId: null,
       modal: null,
-      checkoutAmt: null,
     });
   }, [currentCategory, pushNavState]);
 
@@ -450,11 +412,9 @@ export default function App() {
       cat: currentCategory,
       serviceId: null,
       modal: null,
-      checkoutAmt: null,
     });
   }, [currentCategory, pushNavState]);
 
-  // Modals as 1-step history entries so phone Back closes the modal cleanly
   const handleOpenSupport = useCallback(() => {
     playClickSound();
     pushNavState(
@@ -463,7 +423,6 @@ export default function App() {
         cat: currentCategory,
         serviceId: currentService?.id ?? null,
         modal: 'support',
-        checkoutAmt: null,
       },
       activePage,
     );
@@ -478,26 +437,47 @@ export default function App() {
   }, []);
 
   const handleOpenCheckout = useCallback(
-    (amount: number) => {
-      pushNavState(
-        {
-          page: 'fund',
-          cat: currentCategory,
-          serviceId: null,
-          modal: 'checkout',
-          checkoutAmt: amount,
-        },
-        'fund',
-      );
+    async (amount: number) => {
+      try {
+        const res = await fetch('/api/fund/checkout', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ amount }),
+        });
+        const data = (await res.json()) as {
+          ok?: boolean;
+          amount?: number;
+          qrToken?: string;
+          message?: string;
+        };
+        if (!res.ok || !data.ok || !data.qrToken || typeof data.amount !== 'number') {
+          showToast(data.message || 'Unable to open scanner ❌', true);
+          return;
+        }
+
+        showToast(`Scanner Ready ₹${data.amount} • Pay & Upload Screenshot`);
+        setCheckoutSession({ amount: data.amount, qrToken: data.qrToken });
+        pushNavState(
+          {
+            page: 'fund',
+            cat: currentCategory,
+            serviceId: null,
+            modal: 'checkout',
+          },
+          'fund',
+        );
+      } catch {
+        showToast('Network Error ❌ Try Again', true);
+      }
     },
-    [currentCategory, pushNavState],
+    [currentCategory, pushNavState, showToast],
   );
 
   const handleCloseCheckout = useCallback(() => {
+    setCheckoutSession(null);
     if (historyDepthRef.current > 0) {
       window.history.back();
-    } else {
-      setCheckoutAmount(null);
     }
   }, []);
 
@@ -510,7 +490,6 @@ export default function App() {
         cat: currentCategory,
         serviceId: null,
         modal: 'admin-login',
-        checkoutAmt: null,
       },
       'menu',
     );
@@ -528,25 +507,21 @@ export default function App() {
     async (password: string): Promise<boolean> => {
       unlockAudioContext();
       playClickSound();
-      if (!verifyAdminPassword(password)) {
-        showToast('Wrong Password ❌', true);
-        return false;
-      }
-
       try {
-        await fetch('/api/admin/login', {
+        const res = await fetch('/api/admin/login', {
           method: 'POST',
+          credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ password }),
         });
+        const data = (await res.json()) as { ok?: boolean; message?: string };
+        if (!res.ok || !data.ok) {
+          showToast(data.message || 'Wrong Password ❌', true);
+          return false;
+        }
       } catch {
-        // Local password verification already succeeded
-      }
-
-      try {
-        localStorage.setItem('tp_admin_pass', ADMIN_PASSWORD);
-      } catch {
-        // Ignore storage errors
+        showToast('Network Error ❌', true);
+        return false;
       }
 
       setIsAdminLoggedIn(true);
@@ -557,7 +532,6 @@ export default function App() {
         cat: currentCategory,
         serviceId: null,
         modal: null,
-        checkoutAmt: null,
       });
       return true;
     },
@@ -572,20 +546,22 @@ export default function App() {
       cat: currentCategory,
       serviceId: null,
       modal: null,
-      checkoutAmt: null,
     });
   }, [currentCategory, pushNavState]);
 
-  const handleAdminLogout = useCallback(() => {
+  const handleAdminLogout = useCallback(async () => {
     playClickSound();
     stopIphoneNotification();
     try {
-      localStorage.removeItem('tp_admin_pass');
+      await fetch('/api/admin/logout', {
+        method: 'POST',
+        credentials: 'same-origin',
+      });
     } catch {
-      // Ignore storage errors
+      // Ignore logout network error
     }
     setIsAdminLoggedIn(false);
-    setAdminUtrRequests([]);
+    setAdminPaymentRequests([]);
     setAdminOrders([]);
     showToast('Admin Logged Out');
     pushNavState({
@@ -593,40 +569,48 @@ export default function App() {
       cat: currentCategory,
       serviceId: null,
       modal: null,
-      checkoutAmt: null,
     });
   }, [currentCategory, pushNavState, showToast]);
 
-  const handleSubmitUtr = useCallback(
-    async ({ amount, utr, app }: { amount: number; utr: string; app: string }): Promise<boolean> => {
+  const handleSubmitScreenshot = useCallback(
+    async ({
+      amount,
+      screenshot,
+      app,
+    }: {
+      amount: number;
+      screenshot: string;
+      app: string;
+    }): Promise<boolean> => {
       try {
-        const res = await fetch('/api/utr', {
+        const res = await fetch('/api/fund/submit-screenshot', {
           method: 'POST',
+          credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ uid, amount, utr, app }),
+          body: JSON.stringify({ amount, screenshot, app }),
         });
         const data = (await res.json()) as {
           ok?: boolean;
-          request?: UtrFundRequest;
+          request?: PaymentFundRequest;
           message?: string;
         };
         if (!res.ok || !data.ok || !data.request) {
-          showToast(data.message || 'UTR Submit Failed ❌', true);
+          showToast(data.message || 'Screenshot Submit Failed ❌', true);
           return false;
         }
-        prevUtrStatusRef.current.set(data.request.id, data.request.status);
-        setUtrRequests((prev) => [data.request!, ...prev]);
-        showToast('UTR Submitted ✅ Admin verify krke fund add kr dega');
+        prevPaymentStatusRef.current.set(data.request.id, data.request.status);
+        setPaymentRequests((prev) => [data.request!, ...prev]);
+        showToast('Screenshot Submitted ✅ Admin verify krke fund add kr dega');
         return true;
       } catch {
         showToast('Network Error ❌ Try Again', true);
         return false;
       }
     },
-    [showToast, uid],
+    [showToast],
   );
 
-  const handleAdminUtrAction = useCallback(
+  const handleAdminPaymentAction = useCallback(
     async ({
       id,
       action,
@@ -638,12 +622,10 @@ export default function App() {
     }) => {
       playClickSound();
       try {
-        const res = await fetch('/api/admin/utr-action', {
+        const res = await fetch('/api/admin/payment-action', {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-admin-pass': ADMIN_PASSWORD,
-          },
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ id, action, note }),
         });
         const data = (await res.json()) as { ok?: boolean; message?: string };
@@ -670,10 +652,8 @@ export default function App() {
       try {
         const res = await fetch('/api/admin/order-status', {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-admin-pass': ADMIN_PASSWORD,
-          },
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ order_id: orderId, status }),
         });
         if (res.ok) {
@@ -692,9 +672,11 @@ export default function App() {
     async ({
       link,
       selectedPrice,
+      packIndex,
     }: {
       link: string;
       selectedPrice: PriceTier | null;
+      packIndex: number | null;
     }): Promise<boolean> => {
       playClickSound();
       if (!currentService) return false;
@@ -716,28 +698,18 @@ export default function App() {
         return false;
       }
 
-      if (!selectedPrice) return false;
-
-      const latestUtr =
-        utrRequests.find((r) => r.status === 'approved')?.utr ?? utrRequests[0]?.utr;
-      const newOrder = createOrderRecord({
-        counter,
-        serviceName: currentService.name,
-        pack: selectedPrice.q,
-        price: selectedPrice.p,
-        link,
-        uid,
-        utr: latestUtr,
-      });
+      if (!selectedPrice || packIndex === null) return false;
 
       try {
         const res = await fetch('/api/orders', {
           method: 'POST',
+          credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            order: newOrder,
             category: currentCategory,
             serviceId: currentService.id,
+            packIndex,
+            link: link.trim(),
           }),
         });
         const data = (await res.json()) as {
@@ -748,7 +720,7 @@ export default function App() {
           message?: string;
         };
 
-        if (!res.ok || !data.ok) {
+        if (!res.ok || !data.ok || !data.order) {
           showToast(data.message || 'Low Balance ❌ Please Add Funds', true);
           if (typeof data.balance === 'number') setBalance(data.balance);
           if (data.reason !== 'invalid_link') {
@@ -762,10 +734,9 @@ export default function App() {
             ? data.balance
             : applyOrderDeduction(balance, selectedPrice.p),
         );
-        setCounter((prev) => prev + 1);
-        setOrders((prev) => [data.order ?? newOrder, ...prev]);
+        setOrders((prev) => [data.order!, ...prev]);
 
-        showToast(`Order Successful ✅ ID #${newOrder.id}`);
+        showToast(`Order Successful ✅ ID #${data.order.id}`);
         handleGoOrders();
         return true;
       } catch {
@@ -775,14 +746,11 @@ export default function App() {
     },
     [
       balance,
-      counter,
       currentCategory,
       currentService,
       handleGoFund,
       handleGoOrders,
       showToast,
-      uid,
-      utrRequests,
     ],
   );
 
@@ -870,19 +838,19 @@ export default function App() {
         )}
 
         {activePage === 'orders' && (
-          <OrdersView orders={orders} utrRequests={utrRequests} />
+          <OrdersView orders={orders} paymentRequests={paymentRequests} />
         )}
 
         {activePage === 'fund' && (
           <FundView
             uid={uid}
-            utrRequests={utrRequests}
-            checkoutAmount={checkoutAmount}
+            paymentRequests={paymentRequests}
+            checkoutSession={checkoutSession}
             onOpenCheckout={handleOpenCheckout}
             onCloseCheckout={handleCloseCheckout}
             onBack={() => goBackOneStep('home')}
             onShowToast={showToast}
-            onSubmitUtr={handleSubmitUtr}
+            onSubmitScreenshot={handleSubmitScreenshot}
             onPlaySound={playClickSound}
           />
         )}
@@ -905,11 +873,11 @@ export default function App() {
 
         {activePage === 'admin' && isAdminLoggedIn && (
           <AdminView
-            utrRequests={adminUtrRequests}
+            paymentRequests={adminPaymentRequests}
             orders={adminOrders}
             onBack={() => goBackOneStep('menu')}
             onLogout={handleAdminLogout}
-            onUtrAction={handleAdminUtrAction}
+            onPaymentAction={handleAdminPaymentAction}
             onOrderStatusChange={handleAdminOrderStatus}
             onTestSound={() => {
               unlockAudioContext();

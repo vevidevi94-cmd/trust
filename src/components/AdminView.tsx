@@ -1,18 +1,18 @@
 import React, { useState } from 'react';
-import { BellRing, CheckCircle2, LogOut, XCircle } from 'lucide-react';
-import type { OrderItem, UtrFundRequest } from '../data/services';
+import { BellRing, CheckCircle2, Eye, LogOut, X, XCircle } from 'lucide-react';
+import type { OrderItem, PaymentFundRequest } from '../data/services';
 import {
   formatIndianDateTime,
   getOrderStatusBadgeStyle,
-  getUtrStatusBadgeStyle,
+  getPaymentStatusBadgeStyle,
 } from '../utils/panelLogic';
 
 interface AdminViewProps {
-  utrRequests: UtrFundRequest[];
+  paymentRequests: PaymentFundRequest[];
   orders: OrderItem[];
   onBack: () => void;
   onLogout: () => void;
-  onUtrAction: (params: {
+  onPaymentAction: (params: {
     id: string;
     action: 'approve' | 'wrong_payment';
     note?: string;
@@ -22,23 +22,24 @@ interface AdminViewProps {
 }
 
 export function AdminView({
-  utrRequests,
+  paymentRequests,
   orders,
   onBack,
   onLogout,
-  onUtrAction,
+  onPaymentAction,
   onOrderStatusChange,
   onTestSound,
 }: AdminViewProps) {
-  const [tab, setTab] = useState<'utr' | 'orders'>('utr');
+  const [tab, setTab] = useState<'payments' | 'orders'>('payments');
   const [busyId, setBusyId] = useState<string | null>(null);
   const [notesById, setNotesById] = useState<Record<string, string>>({});
+  const [previewImg, setPreviewImg] = useState<string | null>(null);
 
-  const pendingCount = utrRequests.filter((r) => r.status === 'pending').length;
+  const pendingCount = paymentRequests.filter((r) => r.status === 'pending').length;
 
   const handleAction = async (id: string, action: 'approve' | 'wrong_payment') => {
     setBusyId(id);
-    await onUtrAction({
+    await onPaymentAction({
       id,
       action,
       note: notesById[id]?.trim() || undefined,
@@ -89,12 +90,12 @@ export function AdminView({
       <div className="grid grid-cols-2 gap-2 p-1.5 bg-white rounded-[16px] shadow-[0_4px_12px_rgba(60,20,120,0.08)] mb-4">
         <button
           type="button"
-          onClick={() => setTab('utr')}
+          onClick={() => setTab('payments')}
           className={`py-2.5 px-2 rounded-[12px] text-[12.5px] font-extrabold cursor-pointer transition-colors whitespace-nowrap ${
-            tab === 'utr' ? 'bg-[#7c4dff] text-white' : 'text-[#3a1d6d] hover:bg-[#f3edff]'
+            tab === 'payments' ? 'bg-[#7c4dff] text-white' : 'text-[#3a1d6d] hover:bg-[#f3edff]'
           }`}
         >
-          UTR ({pendingCount} Pending)
+          Payments ({pendingCount} Pending)
         </button>
         <button
           type="button"
@@ -107,15 +108,15 @@ export function AdminView({
         </button>
       </div>
 
-      {tab === 'utr' && (
-        <div className="space-y-3" data-testid="admin-utr-list">
-          {utrRequests.length === 0 ? (
+      {tab === 'payments' && (
+        <div className="space-y-3" data-testid="admin-payment-list">
+          {paymentRequests.length === 0 ? (
             <div className="bg-white rounded-[18px] p-6 text-center text-[#555] text-[14px]">
-              Abhi koi UTR payment request nahi aayi hai.
+              Abhi koi payment screenshot request nahi aayi hai.
             </div>
           ) : (
-            utrRequests.map((req) => {
-              const badge = getUtrStatusBadgeStyle(req.status);
+            paymentRequests.map((req) => {
+              const badge = getPaymentStatusBadgeStyle(req.status);
               const isBusy = busyId === req.id;
               return (
                 <div
@@ -139,9 +140,34 @@ export function AdminView({
                     </span>
                   </div>
 
-                  <div className="mt-1.5 bg-[#f8f5ff] border border-[#e9dffc] rounded-[10px] px-3 py-2 text-[13px] font-extrabold text-[#2d1b4e]">
-                    UTR: <span className="text-[#7c4dff]">{req.utr}</span>
-                  </div>
+                  {req.screenshot && (
+                    <div className="mt-2 bg-[#f8f5ff] border border-[#e9dffc] rounded-[12px] p-2">
+                      <div className="flex items-center justify-between mb-1.5">
+                        <span className="text-[12px] font-extrabold text-[#3a1d6d]">
+                          Payment Screenshot:
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => setPreviewImg(req.screenshot!)}
+                          className="text-[11px] font-bold text-[#7c4dff] inline-flex items-center gap-1 cursor-pointer"
+                        >
+                          <Eye className="w-3.5 h-3.5" />
+                          <span>View Full</span>
+                        </button>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setPreviewImg(req.screenshot!)}
+                        className="w-full block cursor-pointer"
+                      >
+                        <img
+                          src={req.screenshot}
+                          alt={`Payment screenshot from ${req.uid}`}
+                          className="w-full max-h-48 object-contain rounded-[8px] bg-white border border-[#e9dffc]"
+                        />
+                      </button>
+                    </div>
+                  )}
 
                   <div className="text-[11px] text-[#666] mt-1.5 tabular-nums">
                     {req.createdAt ? formatIndianDateTime(req.createdAt) : req.date}
@@ -155,7 +181,7 @@ export function AdminView({
                         onChange={(e) =>
                           setNotesById((prev) => ({ ...prev, [req.id]: e.target.value }))
                         }
-                        placeholder="Optional message (e.g. Wrong UTR / Fund Added)"
+                        placeholder="Optional message (e.g. Fake Screenshot / Fund Added)"
                         className="w-full px-3 py-2 text-[12px] border border-[#e9dffc] rounded-[10px] outline-none focus:border-[#7c4dff]"
                       />
                       <div className="grid grid-cols-2 gap-2">
@@ -225,9 +251,34 @@ export function AdminView({
                   <div className="text-[12px] text-[#7c4dff] break-all mt-0.5">
                     {order.link}
                   </div>
-                  <div className="mt-1.5 bg-[#f8f5ff] border border-[#e9dffc] rounded-[8px] px-2.5 py-1.5 text-[12px] font-bold text-[#2d1b4e]">
-                    UTR: <span className="text-[#7c4dff]">{order.utr || 'No UTR recorded'}</span>
-                  </div>
+
+                  {order.paymentScreenshot ? (
+                    <div className="mt-1.5 bg-[#f8f5ff] border border-[#e9dffc] rounded-[10px] p-2 flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <img
+                          src={order.paymentScreenshot}
+                          alt="Order payment screenshot"
+                          className="w-10 h-10 rounded-[6px] object-cover border border-[#e9dffc]"
+                        />
+                        <span className="text-[11px] font-bold text-[#3a1d6d]">
+                          Payment Screenshot
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setPreviewImg(order.paymentScreenshot!)}
+                        className="text-[11px] font-extrabold text-[#7c4dff] inline-flex items-center gap-1 cursor-pointer px-2 py-1 rounded-lg bg-white border border-[#e9dffc]"
+                      >
+                        <Eye className="w-3.5 h-3.5" />
+                        <span>View</span>
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="mt-1.5 bg-[#f8f5ff] border border-[#e9dffc] rounded-[8px] px-2.5 py-1.5 text-[12px] font-bold text-[#666]">
+                      No Screenshot recorded
+                    </div>
+                  )}
+
                   <div className="text-[11px] text-[#666] mt-1 tabular-nums">
                     {order.date} | {order.order_id}
                   </div>
@@ -255,6 +306,34 @@ export function AdminView({
               );
             })
           )}
+        </div>
+      )}
+
+      {previewImg && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Payment Screenshot Full View"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setPreviewImg(null);
+          }}
+          className="fixed inset-0 bg-black/80 z-[250] flex items-center justify-center p-4"
+        >
+          <div className="relative bg-white rounded-[18px] p-2 max-w-[420px] w-full shadow-2xl">
+            <button
+              type="button"
+              aria-label="Close screenshot preview"
+              onClick={() => setPreviewImg(null)}
+              className="absolute -top-3 -right-3 w-9 h-9 rounded-full bg-black text-white flex items-center justify-center shadow-lg cursor-pointer"
+            >
+              <X className="w-5 h-5" />
+            </button>
+            <img
+              src={previewImg}
+              alt="Full payment screenshot"
+              className="w-full max-h-[75vh] object-contain rounded-[12px]"
+            />
+          </div>
         </div>
       )}
     </section>

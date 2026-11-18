@@ -4,26 +4,27 @@ import {
   applyOrderDeduction,
   createOrderRecord,
   creditWalletBalance,
-  detectNewPendingUtrIds,
+  detectNewPendingPaymentIds,
   formatBalance,
   formatIndianDateTime,
   generateUserId,
   getOrderStatusBadgeStyle,
-  getUtrStatusBadgeStyle,
+  getPaymentStatusBadgeStyle,
   parseHashPage,
   validateFundAmount,
   validateOrderPlacement,
+  validatePaymentScreenshot,
   validatePlatformLink,
-  validateUtrInput,
-  verifyAdminPassword,
 } from './panelLogic';
 
 test('formatIndianDateTime formats UTC timestamp in Asia/Kolkata IST', () => {
-  // 2026-11-18T14:12:51Z -> +5:30 IST = 18/11/2026, 07:42:51 pm
   const utcMs = Date.UTC(2026, 10, 18, 14, 12, 51);
   const formatted = formatIndianDateTime(utcMs).toLowerCase();
   assert.ok(formatted.includes('18/11/2026'), `Expected 18/11/2026 in ${formatted}`);
-  assert.ok(formatted.includes('07:42:51') || formatted.includes('7:42:51'), `Expected 7:42:51 in ${formatted}`);
+  assert.ok(
+    formatted.includes('07:42:51') || formatted.includes('7:42:51'),
+    `Expected 7:42:51 in ${formatted}`,
+  );
   assert.ok(formatted.includes('pm'), `Expected pm in ${formatted}`);
 });
 
@@ -48,67 +49,64 @@ test('validateFundAmount enforces minimum ₹1', () => {
   assert.deepEqual(validateFundAmount('150.5'), { ok: true, amount: 150.5 });
 });
 
-test('validateUtrInput requires minimum 6 alphanumeric characters', () => {
-  assert.deepEqual(validateUtrInput('12345'), {
+test('validatePaymentScreenshot requires valid image data URL', () => {
+  assert.deepEqual(validatePaymentScreenshot(''), {
     ok: false,
-    message: 'Valid UTR number enter karo (min 6 digits)',
+    message: 'Payment ka screenshot upload karo ❌',
   });
-  assert.deepEqual(validateUtrInput(' 4321 9876 5432 '), {
+  assert.deepEqual(validatePaymentScreenshot('not-an-image'), {
+    ok: false,
+    message: 'Payment ka screenshot upload karo ❌',
+  });
+  const sampleBase64 = 'A'.repeat(60);
+  assert.deepEqual(validatePaymentScreenshot(`data:image/jpeg;base64,${sampleBase64}`), {
     ok: true,
-    utr: '432198765432',
+    screenshot: `data:image/jpeg;base64,${sampleBase64}`,
   });
 });
 
-test('verifyAdminPassword checks exact password banti&1945', () => {
-  assert.equal(verifyAdminPassword('wrong'), false);
-  assert.equal(verifyAdminPassword('banti&1945 '), false);
-  assert.equal(verifyAdminPassword('banti&1945'), true);
-});
-
-test('detectNewPendingUtrIds detects only unseen pending requests', () => {
-  const known = new Set(['u1', 'u2']);
+test('detectNewPendingPaymentIds detects only unseen pending requests', () => {
+  const known = new Set(['p1', 'p2']);
   const incoming = [
     {
-      id: 'u1',
+      id: 'p1',
       uid: 'TRUST-1111',
       amount: 40,
-      utr: '111111',
       app: 'GPay',
+      hasScreenshot: true,
       status: 'pending' as const,
       createdAt: 1,
       date: 'd',
     },
     {
-      id: 'u3',
+      id: 'p3',
       uid: 'TRUST-2222',
       amount: 100,
-      utr: '999999',
       app: 'PhonePe',
+      hasScreenshot: true,
       status: 'pending' as const,
       createdAt: 2,
       date: 'd',
     },
     {
-      id: 'u4',
+      id: 'p4',
       uid: 'TRUST-3333',
       amount: 50,
-      utr: '888888',
       app: 'BHIM',
+      hasScreenshot: true,
       status: 'approved' as const,
       createdAt: 3,
       date: 'd',
     },
   ];
-  assert.deepEqual(detectNewPendingUtrIds(known, incoming), ['u3']);
+  assert.deepEqual(detectNewPendingPaymentIds(known, incoming), ['p3']);
 });
 
 test('validatePlatformLink rejects wrong domains and invalid service URLs', () => {
-  // Random text rejected
   assert.equal(
     validatePlatformLink({ link: 'hello', category: 'instagram', serviceId: 'ig-indian-follower' }).ok,
     false,
   );
-  // YouTube link rejected for Instagram
   assert.equal(
     validatePlatformLink({
       link: 'https://youtube.com/@demo',
@@ -117,7 +115,6 @@ test('validatePlatformLink rejects wrong domains and invalid service URLs', () =
     }).ok,
     false,
   );
-  // Instagram Post link rejected for Reels Views (ig-reels-1rs), Reel link accepted
   assert.equal(
     validatePlatformLink({
       link: 'https://www.instagram.com/p/C12345/',
@@ -134,7 +131,6 @@ test('validatePlatformLink rejects wrong domains and invalid service URLs', () =
     }).ok,
     true,
   );
-  // Facebook requires facebook.com / fb.com
   assert.equal(
     validatePlatformLink({
       link: 'https://www.instagram.com/demo/',
@@ -151,7 +147,6 @@ test('validatePlatformLink rejects wrong domains and invalid service URLs', () =
     }).ok,
     true,
   );
-  // Telegram requires t.me and post ID for views
   assert.equal(
     validatePlatformLink({
       link: 'https://t.me/mychannel',
@@ -176,7 +171,6 @@ test('validatePlatformLink rejects wrong domains and invalid service URLs', () =
     }).ok,
     true,
   );
-  // YouTube requires youtube.com / youtu.be and video link for views
   assert.equal(
     validatePlatformLink({
       link: 'https://www.youtube.com/@creator',
@@ -254,7 +248,7 @@ test('validateOrderPlacement checks link, platform validity, selected package, a
   );
 });
 
-test('wallet credit, order deduction, and order record with UTR stay consistent', () => {
+test('wallet credit, order deduction, and order record stay consistent', () => {
   const afterCredit = creditWalletBalance(0, 100);
   assert.equal(afterCredit, 100);
 
@@ -268,7 +262,7 @@ test('wallet credit, order deduction, and order record with UTR stay consistent'
     price: 30,
     link: ' https://instagram.com/demo ',
     uid: 'TRUST-4242',
-    utr: '432198765432',
+    paymentId: 'PAY_1234',
     timestampMs: 1700000000000,
     dateStr: '15/11/2023, 03:43:20 am',
   });
@@ -276,7 +270,7 @@ test('wallet credit, order deduction, and order record with UTR stay consistent'
   assert.equal(order.id, 1);
   assert.equal(order.order_id, 'ORD1700000000000');
   assert.equal(order.link, 'https://instagram.com/demo');
-  assert.equal(order.utr, '432198765432');
+  assert.equal(order.paymentId, 'PAY_1234');
   assert.equal(order.status, 'pending');
   assert.equal(order.uid, 'TRUST-4242');
 });
@@ -284,9 +278,9 @@ test('wallet credit, order deduction, and order record with UTR stay consistent'
 test('status badge helpers return expected styles', () => {
   assert.equal(getOrderStatusBadgeStyle('pending').label, 'PENDING');
   assert.equal(getOrderStatusBadgeStyle('completed').label, 'COMPLETED');
-  assert.equal(getUtrStatusBadgeStyle('pending').label, 'PENDING ⏳');
-  assert.equal(getUtrStatusBadgeStyle('approved').label, 'FUND ADDED ✅');
-  assert.equal(getUtrStatusBadgeStyle('wrong_payment').label, 'WRONG PAYMENT ❌');
+  assert.equal(getPaymentStatusBadgeStyle('pending').label, 'PENDING ⏳');
+  assert.equal(getPaymentStatusBadgeStyle('approved').label, 'FUND ADDED ✅');
+  assert.equal(getPaymentStatusBadgeStyle('wrong_payment').label, 'WRONG PAYMENT ❌');
 });
 
 test('parseHashPage routes valid top-level hashes including #admin', () => {

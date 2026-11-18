@@ -1,30 +1,33 @@
-import React, { useState } from 'react';
-import { Check, Copy, X } from 'lucide-react';
+import React, { useEffect, useRef, useState } from 'react';
+import { CheckCircle2, ImagePlus, Loader2, ShieldCheck, X } from 'lucide-react';
 import {
   MIN_ADD_FUND,
-  UPI_ID,
-  UPI_QR_IMAGE_PATH,
-  type UtrFundRequest,
+  type PaymentFundRequest,
 } from '../data/services';
 import {
   formatIndianDateTime,
-  getUtrStatusBadgeStyle,
+  getPaymentStatusBadgeStyle,
   validateFundAmount,
-  validateUtrInput,
+  validatePaymentScreenshot,
 } from '../utils/panelLogic';
 import { BhimUpiLogo, GPayLogo, PhonePeLogo } from './BrandIcons';
 
+export interface CheckoutSessionState {
+  amount: number;
+  qrToken: string;
+}
+
 interface FundViewProps {
   uid: string;
-  utrRequests: UtrFundRequest[];
-  checkoutAmount: number | null;
-  onOpenCheckout: (amount: number) => void;
+  paymentRequests: PaymentFundRequest[];
+  checkoutSession: CheckoutSessionState | null;
+  onOpenCheckout: (amount: number) => Promise<void>;
   onCloseCheckout: () => void;
   onBack: () => void;
   onShowToast: (message: string, isError?: boolean) => void;
-  onSubmitUtr: (payload: {
+  onSubmitScreenshot: (payload: {
     amount: number;
-    utr: string;
+    screenshot: string;
     app: string;
   }) => Promise<boolean>;
   onPlaySound: () => void;
@@ -32,27 +35,138 @@ interface FundViewProps {
 
 type UpiApp = 'GPay' | 'PhonePe' | 'BHIM';
 
+function compressImageFile(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Failed to read file'));
+    reader.onload = () => {
+      const rawUrl = typeof reader.result === 'string' ? reader.result : '';
+      if (!rawUrl.startsWith('data:image/')) {
+        reject(new Error('Invalid image file'));
+        return;
+      }
+
+      const img = new Image();
+      img.onerror = () => {
+        // Fallback to raw data URL if browser cannot re-encode
+        resolve(rawUrl);
+      };
+      img.onload = () => {
+        const maxDim = 960;
+        let { width, height } = img;
+        if (width > maxDim || height > maxDim) {
+          const ratio = Math.min(maxDim / width, maxDim / height);
+          width = Math.max(1, Math.round(width * ratio));
+          height = Math.max(1, Math.round(height * ratio));
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          resolve(rawUrl);
+          return;
+        }
+        ctx.drawImage(img, 0, 0, width, height);
+        const compressed = canvas.toDataURL('image/jpeg', 0.8);
+        resolve(compressed.length < rawUrl.length ? compressed : rawUrl);
+      };
+      img.src = rawUrl;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
 export function FundView({
   uid,
-  utrRequests,
-  checkoutAmount,
+  paymentRequests,
+  checkoutSession,
   onOpenCheckout,
   onCloseCheckout,
   onBack,
   onShowToast,
-  onSubmitUtr,
+  onSubmitScreenshot,
   onPlaySound,
 }: FundViewProps) {
   const [amountRaw, setAmountRaw] = useState('');
   const [selectedApp, setSelectedApp] = useState<UpiApp>('GPay');
-  const [utrInput, setUtrInput] = useState('');
-  const [submittingUtr, setSubmittingUtr] = useState(false);
-  const [copiedUpi, setCopiedUpi] = useState(false);
-  const [qrImgError, setQrImgError] = useState(false);
+  const [openingCheckout, setOpeningCheckout] = useState(false);
+  const [screenshotDataUrl, setScreenshotDataUrl] = useState<string>('');
+  const [screenshotName, setScreenshotName] = useState<string>('');
+  const [submitting, setSubmitting] = useState(false);
+  const [qrLoading, setQrLoading] = useState(false);
+  const [qrError, setQrError] = useState(false);
 
-  const upiId = UPI_ID;
+  const qrCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const fetchedTokenRef = useRef<string | null>(null);
 
-  const handlePayNow = (e: React.FormEvent) => {
+  useEffect(() => {
+    if (!checkoutSession?.qrToken) {
+      fetchedTokenRef.current = null;
+      return;
+    }
+
+    const token = checkoutSession.qrToken;
+    if (fetchedTokenRef.current === token) return;
+    fetchedTokenRef.current = token;
+
+    let cancelled = false;
+    setQrLoading(true);
+    setQrError(false);
+
+    fetch(`/api/fund/qr?token=${encodeURIComponent(token)}`, {
+      credentials: 'same-origin',
+      cache: 'no-store',
+    })
+      .then(async (res) => {
+        if (!res.ok) throw new Error('QR fetch failed');
+        return res.blob();
+      })
+      .then((blob) => {
+        if (cancelled) return;
+        const objectUrl = URL.createObjectURL(blob);
+        const img = new Image();
+        img.onload = () => {
+          URL.revokeObjectURL(objectUrl);
+          if (cancelled) return;
+          const canvas = qrCanvasRef.current;
+          if (!canvas) return;
+
+          // Crop top QR square region cleanly so bottom UPI ID caption is not rendered in canvas
+          const cropHeight = Math.floor(img.naturalHeight * 0.835);
+          const cropWidth = img.naturalWidth;
+          canvas.width = cropWidth;
+          canvas.height = cropHeight;
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(0, 0, cropWidth, cropHeight);
+            ctx.drawImage(img, 0, 0, cropWidth, cropHeight, 0, 0, cropWidth, cropHeight);
+          }
+          setQrLoading(false);
+        };
+        img.onerror = () => {
+          URL.revokeObjectURL(objectUrl);
+          if (!cancelled) {
+            setQrError(true);
+            setQrLoading(false);
+          }
+        };
+        img.src = objectUrl;
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setQrError(true);
+          setQrLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [checkoutSession?.qrToken]);
+
+  const handlePayNow = async (e: React.FormEvent) => {
     e.preventDefault();
     onPlaySound();
     const result = validateFundAmount(amountRaw);
@@ -60,39 +174,57 @@ export function FundView({
       onShowToast(result.message, true);
       return;
     }
-    onShowToast(`Scanner Ready ₹${result.amount} • Pay & Enter UTR`);
-    onOpenCheckout(result.amount);
+    setOpeningCheckout(true);
+    setScreenshotDataUrl('');
+    setScreenshotName('');
+    await onOpenCheckout(result.amount);
+    setOpeningCheckout(false);
   };
 
-  const handleCopyUpi = () => {
-    onPlaySound();
-    navigator.clipboard?.writeText(upiId).catch(() => {});
-    setCopiedUpi(true);
-    onShowToast(`UPI ID Copied ✅ ${upiId}`);
-    setTimeout(() => setCopiedUpi(false), 2000);
+  const handleScreenshotChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      onShowToast('Sirf image screenshot upload karo ❌', true);
+      return;
+    }
+    try {
+      const compressed = await compressImageFile(file);
+      const check = validatePaymentScreenshot(compressed);
+      if (!check.ok) {
+        onShowToast(check.message, true);
+        return;
+      }
+      setScreenshotDataUrl(check.screenshot);
+      setScreenshotName(file.name);
+      onPlaySound();
+    } catch {
+      onShowToast('Screenshot read failed ❌ Try another image', true);
+    }
   };
 
-  const handleUtrSubmit = async (e: React.FormEvent) => {
+  const handleScreenshotSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (checkoutAmount === null) return;
+    if (!checkoutSession) return;
     onPlaySound();
 
-    const utrCheck = validateUtrInput(utrInput);
-    if (!utrCheck.ok) {
-      onShowToast(utrCheck.message, true);
+    const check = validatePaymentScreenshot(screenshotDataUrl);
+    if (!check.ok) {
+      onShowToast(check.message, true);
       return;
     }
 
-    setSubmittingUtr(true);
-    const ok = await onSubmitUtr({
-      amount: checkoutAmount,
-      utr: utrCheck.utr,
+    setSubmitting(true);
+    const ok = await onSubmitScreenshot({
+      amount: checkoutSession.amount,
+      screenshot: check.screenshot,
       app: selectedApp,
     });
-    setSubmittingUtr(false);
+    setSubmitting(false);
 
     if (ok) {
-      setUtrInput('');
+      setScreenshotDataUrl('');
+      setScreenshotName('');
       setAmountRaw('');
       onCloseCheckout();
     }
@@ -173,36 +305,28 @@ export function FundView({
           Payment method: Instant UPI ({selectedApp})
         </div>
 
-        <div className="mt-[10px] flex items-center justify-between gap-2 bg-[#f8f5ff] border border-[#e9dffc] rounded-[12px] px-3 py-2 text-[12px]">
-          <span className="text-[#555] font-semibold">
-            UPI ID: <strong className="text-[#2d1b4e]">{upiId}</strong>
-          </span>
-          <button
-            type="button"
-            onClick={handleCopyUpi}
-            className="inline-flex items-center gap-1 text-[#7c4dff] font-bold cursor-pointer shrink-0"
-          >
-            {copiedUpi ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-            {copiedUpi ? 'Copied' : 'Copy'}
-          </button>
+        <div className="mt-[10px] flex items-center justify-center gap-1.5 bg-[#f8f5ff] border border-[#e9dffc] rounded-[12px] px-3 py-2 text-[12px] text-[#3a1d6d] font-semibold">
+          <ShieldCheck className="w-4 h-4 text-[#2e7d32] shrink-0" aria-hidden="true" />
+          <span>Secure UPI Scanner • Pay & Upload Screenshot</span>
         </div>
 
         <button
           type="submit"
-          className="w-full bg-[#7c4dff] text-white border-0 p-[14px] rounded-[14px] font-extrabold text-[15px] mt-[14px] cursor-pointer active:scale-[0.98] transition-transform focus-visible:outline-2 focus-visible:outline-[#3a1d6d]"
+          disabled={openingCheckout}
+          className="w-full bg-[#7c4dff] text-white border-0 p-[14px] rounded-[14px] font-extrabold text-[15px] mt-[14px] cursor-pointer active:scale-[0.98] transition-transform disabled:opacity-60 focus-visible:outline-2 focus-visible:outline-[#3a1d6d]"
         >
-          Pay Now
+          {openingCheckout ? 'Opening Scanner...' : 'Pay Now'}
         </button>
       </form>
 
-      {utrRequests.length > 0 && (
+      {paymentRequests.length > 0 && (
         <div className="mt-4">
           <h2 className="text-[16px] font-extrabold text-[#3a1d6d] mb-2 px-1">
-            Payment & UTR Status
+            Payment & Verification Status
           </h2>
-          <div className="space-y-2.5" data-testid="user-utr-list">
-            {utrRequests.map((req) => {
-              const badge = getUtrStatusBadgeStyle(req.status);
+          <div className="space-y-2.5" data-testid="user-payment-list">
+            {paymentRequests.map((req) => {
+              const badge = getPaymentStatusBadgeStyle(req.status);
               return (
                 <div
                   key={req.id}
@@ -220,7 +344,7 @@ export function FundView({
                     </span>
                   </div>
                   <div className="text-[12px] font-bold text-[#7c4dff] mt-1">
-                    UTR: {req.utr}
+                    Payment Screenshot Submitted ✅
                   </div>
                   {req.adminMessage && (
                     <div
@@ -243,7 +367,7 @@ export function FundView({
         </div>
       )}
 
-      {checkoutAmount !== null && (
+      {checkoutSession && (
         <div
           role="dialog"
           aria-modal="true"
@@ -255,8 +379,9 @@ export function FundView({
         >
           <form
             noValidate
-            onSubmit={handleUtrSubmit}
-            className="modal-pop-anim bg-white rounded-[22px] p-5 w-full max-w-[380px] shadow-[0_20px_40px_rgba(0,0,0,0.3)] text-center my-auto"
+            onSubmit={handleScreenshotSubmit}
+            onContextMenu={(e) => e.preventDefault()}
+            className="modal-pop-anim bg-white rounded-[22px] p-5 w-full max-w-[380px] shadow-[0_20px_40px_rgba(0,0,0,0.3)] text-center my-auto select-none"
           >
             <div className="flex justify-between items-center mb-3">
               <h2 id="upi-checkout-title" className="text-[#3a1d6d] font-extrabold text-[18px]">
@@ -277,62 +402,99 @@ export function FundView({
                 Paying via {selectedApp} • ID: <span className="text-[#7c4dff]">{uid}</span>
               </div>
               <div className="text-[26px] font-extrabold text-[#3a1d6d] my-1 tabular-nums">
-                ₹{checkoutAmount.toFixed(2)}
+                ₹{checkoutSession.amount.toFixed(2)}
               </div>
 
-              <div className="my-2">
-                {!qrImgError ? (
-                  <img
-                    src={UPI_QR_IMAGE_PATH}
-                    alt={`UPI QR Code for ${upiId}`}
-                    referrerPolicy="no-referrer"
-                    onError={() => setQrImgError(true)}
-                    className="w-48 h-48 mx-auto rounded-[16px] object-contain bg-black p-1.5 shadow-sm"
+              <div className="my-2 flex items-center justify-center">
+                <div className="relative w-48 h-48 rounded-[16px] bg-black p-2 shadow-sm flex items-center justify-center overflow-hidden">
+                  <canvas
+                    ref={qrCanvasRef}
+                    aria-label="Protected UPI QR Code"
+                    draggable={false}
+                    className={`w-full h-full object-contain rounded-[10px] pointer-events-none ${
+                      qrLoading || qrError ? 'opacity-0' : 'opacity-100'
+                    }`}
                   />
-                ) : (
-                  <div className="w-44 h-44 mx-auto rounded-[16px] bg-black text-white flex flex-col items-center justify-center p-4">
-                    <span className="text-xs text-[#ffeb3b] font-bold">Scan & Pay via UPI</span>
-                    <span className="text-sm font-extrabold mt-1">{upiId}</span>
-                  </div>
-                )}
+                  {qrLoading && (
+                    <div className="absolute inset-0 flex flex-col items-center justify-center text-white text-xs gap-1.5">
+                      <Loader2 className="w-6 h-6 animate-spin text-[#ffeb3b]" />
+                      <span>Loading Scanner...</span>
+                    </div>
+                  )}
+                  {qrError && (
+                    <div className="absolute inset-0 flex flex-col items-center justify-center text-white text-xs p-3">
+                      <span className="text-[#ffeb3b] font-bold">Scanner Unavailable</span>
+                      <span className="mt-1 opacity-80">Close & tap Pay Now again</span>
+                    </div>
+                  )}
+                </div>
               </div>
 
-              <div className="flex items-center justify-between gap-2 bg-white border border-[#e9dffc] rounded-[12px] px-3 py-2 text-[12px]">
-                <span className="font-bold text-[#2d1b4e] truncate">{upiId}</span>
-                <button
-                  type="button"
-                  onClick={handleCopyUpi}
-                  className="inline-flex items-center gap-1 text-[#7c4dff] font-bold cursor-pointer shrink-0"
-                >
-                  {copiedUpi ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-                  {copiedUpi ? 'Copied' : 'Copy'}
-                </button>
+              <div className="text-[11px] font-semibold text-[#555] mt-1">
+                Scan QR with PhonePe / GPay / Paytm / BHIM
               </div>
             </div>
 
             <div className="mt-3 text-left">
               <label
-                htmlFor="utr-number-input"
-                className="block text-[13px] font-bold text-[#3a1d6d] mb-1"
+                htmlFor="payment-screenshot-input"
+                className="block text-[13px] font-bold text-[#3a1d6d] mb-1.5"
               >
-                Enter UTR / Reference Number (After Pay)
+                Upload Payment Screenshot (After Pay)
               </label>
+
+              <label
+                htmlFor="payment-screenshot-input"
+                className="w-full flex flex-col items-center justify-center gap-1.5 p-3 border-2 border-dashed border-[#7c4dff]/50 bg-[#f8f5ff] rounded-[14px] cursor-pointer hover:bg-[#f0e8ff] transition-colors"
+              >
+                {screenshotDataUrl ? (
+                  <div className="w-full flex items-center gap-3">
+                    <img
+                      src={screenshotDataUrl}
+                      alt="Uploaded payment screenshot preview"
+                      className="w-14 h-14 rounded-[10px] object-cover border border-[#e9dffc] shrink-0"
+                    />
+                    <div className="min-w-0 flex-1 text-left">
+                      <div className="text-[12px] font-extrabold text-[#2e7d32] flex items-center gap-1">
+                        <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                        <span>Screenshot Selected</span>
+                      </div>
+                      <div className="text-[11px] text-[#555] truncate">
+                        {screenshotName || 'payment-screenshot.jpg'}
+                      </div>
+                      <div className="text-[11px] text-[#7c4dff] font-bold mt-0.5">
+                        Tap to change image
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <ImagePlus className="w-6 h-6 text-[#7c4dff]" aria-hidden="true" />
+                    <span className="text-[13px] font-bold text-[#3a1d6d]">
+                      Select Payment Screenshot
+                    </span>
+                    <span className="text-[11px] text-[#666]">
+                      PNG, JPG or WEBP screenshot
+                    </span>
+                  </>
+                )}
+              </label>
+
               <input
-                id="utr-number-input"
-                type="text"
-                value={utrInput}
-                onChange={(e) => setUtrInput(e.target.value)}
-                placeholder="Enter 12-digit UTR Number"
-                className="w-full p-[12px] border-2 border-[#e9dffc] rounded-[12px] outline-none text-[14px] text-[#2d1b4e] focus:border-[#7c4dff]"
+                id="payment-screenshot-input"
+                type="file"
+                accept="image/*"
+                onChange={handleScreenshotChange}
+                className="sr-only"
               />
             </div>
 
             <button
               type="submit"
-              disabled={submittingUtr}
+              disabled={submitting}
               className="w-full bg-[#2e7d32] text-white border-0 p-[13px] rounded-[14px] font-extrabold text-[14px] mt-3 cursor-pointer active:scale-[0.98] transition-transform disabled:opacity-60"
             >
-              {submittingUtr ? 'Submitting UTR...' : 'Submit UTR ✅'}
+              {submitting ? 'Submitting Screenshot...' : 'Submit Payment Screenshot ✅'}
             </button>
 
             <button

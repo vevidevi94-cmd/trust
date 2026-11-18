@@ -1,10 +1,9 @@
 import {
-  ADMIN_PASSWORD,
   MIN_ADD_FUND,
   type CategoryKey,
   type OrderItem,
+  type PaymentFundRequest,
   type PriceTier,
-  type UtrFundRequest,
 } from '../data/services';
 
 export type ActivePage = 'home' | 'services' | 'prices' | 'orders' | 'fund' | 'menu' | 'admin';
@@ -42,23 +41,20 @@ export function validateFundAmount(
   return { ok: true, amount: Math.round(amount * 100) / 100 };
 }
 
-export function validateUtrInput(
-  raw: string,
-): { ok: true; utr: string } | { ok: false; message: string } {
-  const cleaned = raw.trim().replace(/\s+/g, '');
-  if (cleaned.length < 6 || !/^[A-Za-z0-9_-]{6,40}$/.test(cleaned)) {
-    return { ok: false, message: 'Valid UTR number enter karo (min 6 digits)' };
+export function validatePaymentScreenshot(
+  dataUrl: string | null | undefined,
+): { ok: true; screenshot: string } | { ok: false; message: string } {
+  const trimmed = (dataUrl || '').trim();
+  const match = /^data:image\/(png|jpeg|jpg|webp);base64,([A-Za-z0-9+/=]+)$/i.exec(trimmed);
+  if (!match || match[2].length < 40) {
+    return { ok: false, message: 'Payment ka screenshot upload karo ❌' };
   }
-  return { ok: true, utr: cleaned };
+  return { ok: true, screenshot: trimmed };
 }
 
-export function verifyAdminPassword(password: string): boolean {
-  return password === ADMIN_PASSWORD;
-}
-
-export function detectNewPendingUtrIds(
+export function detectNewPendingPaymentIds(
   knownIds: Set<string>,
-  incoming: UtrFundRequest[],
+  incoming: PaymentFundRequest[],
 ): string[] {
   return incoming
     .filter((req) => req.status === 'pending' && !knownIds.has(req.id))
@@ -270,7 +266,7 @@ export function createOrderRecord(params: {
   price: number;
   link: string;
   uid: string;
-  utr?: string;
+  paymentId?: string;
   timestampMs?: number;
   dateStr?: string;
 }): OrderItem {
@@ -286,7 +282,7 @@ export function createOrderRecord(params: {
     status: 'pending',
     date: params.dateStr ?? formatIndianDateTime(ts),
     uid: params.uid,
-    ...(params.utr ? { utr: params.utr } : {}),
+    ...(params.paymentId ? { paymentId: params.paymentId } : {}),
   };
 }
 
@@ -308,7 +304,7 @@ export function getOrderStatusBadgeStyle(status: string): {
   return { bg: '#fff3cd', color: '#856404', label: status.toUpperCase() };
 }
 
-export function getUtrStatusBadgeStyle(status: string): {
+export function getPaymentStatusBadgeStyle(status: string): {
   bg: string;
   color: string;
   label: string;

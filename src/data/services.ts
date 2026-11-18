@@ -43,18 +43,21 @@ export interface OrderItem {
   status: OrderStatus | string;
   date: string;
   uid: string;
-  utr?: string;
+  paymentId?: string;
+  paymentScreenshot?: string;
+  hasPaymentScreenshot?: boolean;
 }
 
-export type UtrRequestStatus = 'pending' | 'approved' | 'wrong_payment';
+export type PaymentRequestStatus = 'pending' | 'approved' | 'wrong_payment';
 
-export interface UtrFundRequest {
+export interface PaymentFundRequest {
   id: string;
   uid: string;
   amount: number;
-  utr: string;
   app: string;
-  status: UtrRequestStatus;
+  screenshot?: string;
+  hasScreenshot?: boolean;
+  status: PaymentRequestStatus;
   adminMessage?: string;
   createdAt: number;
   date: string;
@@ -280,9 +283,4 @@ export const SERVICE_CATALOG: Record<CategoryKey, ServiceItem[]> = {
 export const TELEGRAM_SUPPORT_URL = 'https://t.me/Iamkillerb';
 export const TELEGRAM_HANDLE = '@Iamkillerb';
 export const POSTER_IMAGE_PATH = '/assets/aistudio/poster_518c6229.jpg';
-export const UPI_ID = 'skiend@axl';
-export const UPI_QR_IMAGE_PATH = '/assets/aistudio/IMG_20261118_190306_4329482a.jpg';
 export const MIN_ADD_FUND = 1;
-export const ADMIN_PASSWORD = 'banti&1945';
-export const FIREBASE_RTDB_URL =
-  'https://trusted-91b2d-default-rtdb.asia-southeast1.firebasedatabase.app';
