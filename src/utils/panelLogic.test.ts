@@ -39,10 +39,11 @@ test('formatBalance formats numeric amounts to two decimal places', () => {
   assert.equal(formatBalance(12.5), '12.50');
 });
 
-test('validateFundAmount enforces minimum ₹40', () => {
-  assert.deepEqual(validateFundAmount(''), { ok: false, message: 'Minimum Add Fund ₹40 hai' });
-  assert.deepEqual(validateFundAmount('1'), { ok: false, message: 'Minimum Add Fund ₹40 hai' });
-  assert.deepEqual(validateFundAmount('39'), { ok: false, message: 'Minimum Add Fund ₹40 hai' });
+test('validateFundAmount enforces minimum ₹1', () => {
+  assert.deepEqual(validateFundAmount(''), { ok: false, message: 'Minimum Add Fund ₹1 hai' });
+  assert.deepEqual(validateFundAmount('0'), { ok: false, message: 'Minimum Add Fund ₹1 hai' });
+  assert.deepEqual(validateFundAmount('0.5'), { ok: false, message: 'Minimum Add Fund ₹1 hai' });
+  assert.deepEqual(validateFundAmount('1'), { ok: true, amount: 1 });
   assert.deepEqual(validateFundAmount('40'), { ok: true, amount: 40 });
   assert.deepEqual(validateFundAmount('150.5'), { ok: true, amount: 150.5 });
 });

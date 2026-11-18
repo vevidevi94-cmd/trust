@@ -282,7 +282,7 @@ export const TELEGRAM_HANDLE = '@Iamkillerb';
 export const POSTER_IMAGE_PATH = '/assets/aistudio/poster_518c6229.jpg';
 export const UPI_ID = 'skiend@axl';
 export const UPI_QR_IMAGE_PATH = '/assets/aistudio/IMG_20261118_190306_4329482a.jpg';
-export const MIN_ADD_FUND = 40;
+export const MIN_ADD_FUND = 1;
 export const ADMIN_PASSWORD = 'banti&1945';
 export const FIREBASE_RTDB_URL =
   'https://trusted-91b2d-default-rtdb.asia-southeast1.firebasedatabase.app';

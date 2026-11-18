@@ -240,7 +240,7 @@ async function startServer() {
     res.json({ ok: true, balance, utrRequests, orders });
   });
 
-  // Submit a UTR payment request (Min ₹40)
+  // Submit a UTR payment request (Min ₹1)
   app.post('/api/utr', async (req, res) => {
     const uid = String(req.body?.uid || '').trim();
     const amount = Number(req.body?.amount);
@@ -251,8 +251,8 @@ async function startServer() {
       res.status(400).json({ ok: false, message: 'User ID missing' });
       return;
     }
-    if (!Number.isFinite(amount) || amount < 40) {
-      res.status(400).json({ ok: false, message: 'Minimum Add Fund ₹40 hai' });
+    if (!Number.isFinite(amount) || amount < 1) {
+      res.status(400).json({ ok: false, message: 'Minimum Add Fund ₹1 hai' });
       return;
     }
     if (utr.length < 6) {
