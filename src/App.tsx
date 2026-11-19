@@ -15,6 +15,7 @@ import {
   mergeAdminOrders,
   mergeLiveCatalog,
   parseHashPage,
+  shouldAdoptServerVersion,
   validateDirectOrderInput,
   type ActivePage,
   type AdminStatusOverride,
@@ -53,7 +54,10 @@ const STORAGE_ADMIN_ORDERS_CACHE_KEY = 'tp_admin_orders_cache_v2';
 const STORAGE_ADMIN_DELETED_IDS_KEY = 'tp_admin_deleted_ids_v2';
 const STORAGE_ADMIN_STATUS_OVERRIDES_KEY = 'tp_admin_status_overrides_v1';
 const STORAGE_LIVE_CATALOG_KEY = 'tp_live_catalog_v1';
+const STORAGE_LIVE_CATALOG_UPDATED_AT_KEY = 'tp_live_catalog_ts_v1';
+const STORAGE_LIVE_CATALOG_TOKEN_KEY = 'tp_live_catalog_token_v1';
 const STORAGE_LIVE_POSTER_KEY = 'tp_live_poster_v1';
+const STORAGE_LIVE_POSTER_UPDATED_AT_KEY = 'tp_live_poster_ts_v1';
 const LIVE_CHANNEL_NAME = 'trustedpanel_live_sync_v1';
 
 function readSavedUserToken(): string {
@@ -172,6 +176,46 @@ function readCachedPoster(): string | null {
   }
 }
 
+function readCachedTimestamp(key: string): number {
+  try {
+    const num = Number(localStorage.getItem(key) || '0');
+    return Number.isFinite(num) && num > 0 ? num : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function readCachedCatalogToken(): string {
+  try {
+    return localStorage.getItem(STORAGE_LIVE_CATALOG_TOKEN_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
+function serializeCatalogForDiff(catalog: Record<CategoryKey, ServiceItem[]>): string {
+  return JSON.stringify(
+    (Object.keys(catalog) as CategoryKey[]).map((k) => [
+      k,
+      catalog[k].map((s) => [s.id, s.name, s.prices]),
+    ]),
+  );
+}
+
+function toCatalogOverridePayload(
+  catalog: Record<CategoryKey, ServiceItem[]>,
+): Record<string, ServiceCatalogOverrideItem[]> {
+  const payload: Record<string, ServiceCatalogOverrideItem[]> = {};
+  for (const catKey of Object.keys(catalog) as CategoryKey[]) {
+    payload[catKey] = catalog[catKey].map((svc) => ({
+      id: svc.id,
+      name: svc.name,
+      prices: svc.prices,
+    }));
+  }
+  return payload;
+}
+
 function broadcastLiveSignal(
   type: 'new_order' | 'order_updated' | 'order_deleted' | 'catalog_updated',
 ): void {
@@ -241,6 +285,23 @@ export default function App() {
   const historyDepthRef = useRef<number>(0);
   const initialHashPageRef = useRef<ActivePage>(parseHashPage(window.location.hash));
   const adminSyncSeqRef = useRef<number>(0);
+  const catalogSyncSeqRef = useRef<number>(0);
+  const catalogUpdatedAtRef = useRef<number>(
+    readCachedTimestamp(STORAGE_LIVE_CATALOG_UPDATED_AT_KEY),
+  );
+  const catalogTokenRef = useRef<string>(readCachedCatalogToken());
+  const posterUpdatedAtRef = useRef<number>(
+    readCachedTimestamp(STORAGE_LIVE_POSTER_UPDATED_AT_KEY),
+  );
+  const liveCatalogRef = useRef<Record<CategoryKey, ServiceItem[]>>(liveCatalog);
+  const liveCatalogJsonRef = useRef<string>(serializeCatalogForDiff(liveCatalog));
+  const livePosterRef = useRef<string | null>(livePoster);
+  const lastRehydrateMsRef = useRef<number>(0);
+  const isAdminLoggedInRef = useRef<boolean>(false);
+
+  useEffect(() => {
+    isAdminLoggedInRef.current = isAdminLoggedIn;
+  }, [isAdminLoggedIn]);
 
   const showToast = useCallback((message: string, isError = false) => {
     if (toastTimerRef.current !== null) {
@@ -380,12 +441,15 @@ export default function App() {
     [currentCategory, pushNavState],
   );
 
-  // Helper to attach persistent HMAC user token header in case cookies are blocked in WebViews
+  // Helper to attach persistent HMAC user token + signed live catalog token headers
   const getUserHeaders = useCallback(
     (extra?: Record<string, string>): Record<string, string> => {
       const headers: Record<string, string> = { ...(extra ?? {}) };
       if (userToken) {
         headers['x-user-token'] = userToken;
+      }
+      if (catalogTokenRef.current) {
+        headers['x-catalog-token'] = catalogTokenRef.current;
       }
       return headers;
     },
@@ -485,41 +549,147 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [syncUserState]);
 
-  // Sync live Admin-edited services, prices & Home poster
+  // Sync live Admin-edited services, prices & Home poster (never reverts to stale/cold server state)
   const syncLiveCatalog = useCallback(async () => {
+    const reqSeq = ++catalogSyncSeqRef.current;
     try {
+      const headers: Record<string, string> = {};
+      if (catalogTokenRef.current) {
+        headers['x-catalog-token'] = catalogTokenRef.current;
+      }
       const res = await fetch('/api/catalog', {
         credentials: 'same-origin',
         cache: 'no-store',
+        headers,
       });
-      if (!res.ok) return;
+      if (!res.ok || reqSeq !== catalogSyncSeqRef.current) return;
       const data = (await res.json()) as {
         ok?: boolean;
         catalog?: Record<string, ServiceCatalogOverrideItem[]>;
+        catalogUpdatedAt?: number;
+        catalogToken?: string | null;
         posterImage?: string | null;
+        posterUpdatedAt?: number;
       };
-      if (!data.ok) return;
+      if (!data.ok || reqSeq !== catalogSyncSeqRef.current) return;
 
-      if (data.catalog) {
+      const serverCatalogTs =
+        typeof data.catalogUpdatedAt === 'number' && Number.isFinite(data.catalogUpdatedAt)
+          ? data.catalogUpdatedAt
+          : 0;
+      const serverPosterTs =
+        typeof data.posterUpdatedAt === 'number' && Number.isFinite(data.posterUpdatedAt)
+          ? data.posterUpdatedAt
+          : 0;
+
+      const localCatalogTs = catalogUpdatedAtRef.current;
+      const localPosterTs = posterUpdatedAtRef.current;
+
+      if (
+        data.catalog &&
+        shouldAdoptServerVersion({ localUpdatedAt: localCatalogTs, serverUpdatedAt: serverCatalogTs })
+      ) {
         const merged = mergeLiveCatalog(SERVICE_CATALOG, data.catalog);
-        setLiveCatalog(merged);
+        const mergedJson = serializeCatalogForDiff(merged);
+        if (mergedJson !== liveCatalogJsonRef.current) {
+          liveCatalogJsonRef.current = mergedJson;
+          liveCatalogRef.current = merged;
+          setLiveCatalog(merged);
+        }
+        if (serverCatalogTs > 0) {
+          catalogUpdatedAtRef.current = Math.max(catalogUpdatedAtRef.current, serverCatalogTs);
+        }
+        if (typeof data.catalogToken === 'string' && data.catalogToken) {
+          catalogTokenRef.current = data.catalogToken;
+        }
         try {
           localStorage.setItem(STORAGE_LIVE_CATALOG_KEY, JSON.stringify(data.catalog));
+          if (catalogUpdatedAtRef.current > 0) {
+            localStorage.setItem(
+              STORAGE_LIVE_CATALOG_UPDATED_AT_KEY,
+              String(catalogUpdatedAtRef.current),
+            );
+          }
+          if (catalogTokenRef.current) {
+            localStorage.setItem(STORAGE_LIVE_CATALOG_TOKEN_KEY, catalogTokenRef.current);
+          }
         } catch {
           // Ignore storage quota errors
         }
       }
-      if (data.posterImage !== undefined) {
-        const nextPoster = typeof data.posterImage === 'string' && data.posterImage ? data.posterImage : null;
-        setLivePoster(nextPoster);
+
+      if (
+        data.posterImage !== undefined &&
+        shouldAdoptServerVersion({ localUpdatedAt: localPosterTs, serverUpdatedAt: serverPosterTs })
+      ) {
+        const nextPoster =
+          typeof data.posterImage === 'string' && data.posterImage ? data.posterImage : null;
+        if (nextPoster !== livePosterRef.current) {
+          livePosterRef.current = nextPoster;
+          setLivePoster(nextPoster);
+        }
+        if (serverPosterTs > 0) {
+          posterUpdatedAtRef.current = Math.max(posterUpdatedAtRef.current, serverPosterTs);
+        }
         try {
           if (nextPoster) {
             localStorage.setItem(STORAGE_LIVE_POSTER_KEY, nextPoster);
           } else {
             localStorage.removeItem(STORAGE_LIVE_POSTER_KEY);
           }
+          if (posterUpdatedAtRef.current > 0) {
+            localStorage.setItem(
+              STORAGE_LIVE_POSTER_UPDATED_AT_KEY,
+              String(posterUpdatedAtRef.current),
+            );
+          }
         } catch {
           // Ignore storage quota errors
+        }
+      }
+
+      // If Admin is logged in and a cold serverless instance fell behind Admin's saved version, silently rehydrate it
+      const now = Date.now();
+      if (isAdminLoggedInRef.current && now - lastRehydrateMsRef.current > 5000) {
+        const needCatHeal = localCatalogTs > 0 && serverCatalogTs < localCatalogTs;
+        const needPosterHeal = localPosterTs > 0 && serverPosterTs < localPosterTs;
+        if (needCatHeal || needPosterHeal) {
+          lastRehydrateMsRef.current = now;
+          if (needCatHeal) {
+            void fetch('/api/admin/catalog', {
+              method: 'POST',
+              credentials: 'same-origin',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                catalog: toCatalogOverridePayload(liveCatalogRef.current),
+                clientUpdatedAt: localCatalogTs,
+              }),
+            })
+              .then((r) => (r.ok ? r.json() : null))
+              .then((d: { ok?: boolean; catalogToken?: string | null } | null) => {
+                if (d?.ok && typeof d.catalogToken === 'string' && d.catalogToken) {
+                  catalogTokenRef.current = d.catalogToken;
+                  try {
+                    localStorage.setItem(STORAGE_LIVE_CATALOG_TOKEN_KEY, d.catalogToken);
+                  } catch {
+                    // Ignore storage errors
+                  }
+                }
+              })
+              .catch(() => {});
+          }
+          if (needPosterHeal) {
+            void fetch('/api/admin/poster', {
+              method: 'POST',
+              credentials: 'same-origin',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(
+                livePosterRef.current
+                  ? { posterImage: livePosterRef.current, clientUpdatedAt: localPosterTs }
+                  : { reset: true, clientUpdatedAt: localPosterTs },
+              ),
+            }).catch(() => {});
+          }
         }
       }
     } catch {
@@ -531,7 +701,7 @@ export default function App() {
     void syncLiveCatalog();
     const timer = window.setInterval(() => {
       void syncLiveCatalog();
-    }, 4000);
+    }, 2000);
     return () => window.clearInterval(timer);
   }, [syncLiveCatalog]);
 
@@ -1179,38 +1349,49 @@ export default function App() {
   const handleAdminSaveCatalog = useCallback(
     async (nextCatalog: Record<CategoryKey, ServiceItem[]>): Promise<boolean> => {
       playClickSound();
-      const payload: Record<string, ServiceCatalogOverrideItem[]> = {};
-      for (const catKey of Object.keys(nextCatalog) as CategoryKey[]) {
-        payload[catKey] = nextCatalog[catKey].map((svc) => ({
-          id: svc.id,
-          name: svc.name,
-          prices: svc.prices,
-        }));
-      }
+      // Invalidate any in-flight /api/catalog poll so it cannot revert this edit
+      catalogSyncSeqRef.current += 1;
+      const payload = toCatalogOverridePayload(nextCatalog);
+      const optimisticTs = Math.max(Date.now(), catalogUpdatedAtRef.current + 1);
       try {
         const res = await fetch('/api/admin/catalog', {
           method: 'POST',
           credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ catalog: payload }),
+          body: JSON.stringify({ catalog: payload, clientUpdatedAt: optimisticTs }),
         });
         const data = (await res.json()) as {
           ok?: boolean;
           catalog?: Record<string, ServiceCatalogOverrideItem[]>;
+          catalogUpdatedAt?: number;
+          catalogToken?: string | null;
           message?: string;
         };
         if (!res.ok || !data.ok) {
           showToast(data.message || 'Save failed ❌', true);
           return false;
         }
-        if (data.catalog) {
-          const merged = mergeLiveCatalog(SERVICE_CATALOG, data.catalog);
-          setLiveCatalog(merged);
-          try {
-            localStorage.setItem(STORAGE_LIVE_CATALOG_KEY, JSON.stringify(data.catalog));
-          } catch {
-            // Ignore storage errors
+        const savedTs = Math.max(
+          optimisticTs,
+          typeof data.catalogUpdatedAt === 'number' ? data.catalogUpdatedAt : 0,
+        );
+        catalogUpdatedAtRef.current = savedTs;
+        if (typeof data.catalogToken === 'string' && data.catalogToken) {
+          catalogTokenRef.current = data.catalogToken;
+        }
+        const appliedPayload = data.catalog ?? payload;
+        const merged = mergeLiveCatalog(SERVICE_CATALOG, appliedPayload);
+        liveCatalogRef.current = merged;
+        liveCatalogJsonRef.current = serializeCatalogForDiff(merged);
+        setLiveCatalog(merged);
+        try {
+          localStorage.setItem(STORAGE_LIVE_CATALOG_KEY, JSON.stringify(appliedPayload));
+          localStorage.setItem(STORAGE_LIVE_CATALOG_UPDATED_AT_KEY, String(savedTs));
+          if (catalogTokenRef.current) {
+            localStorage.setItem(STORAGE_LIVE_CATALOG_TOKEN_KEY, catalogTokenRef.current);
           }
+        } catch {
+          // Ignore storage errors
         }
         broadcastLiveSignal('catalog_updated');
         showToast('Prices & Service Live Updated ✅');
@@ -1225,24 +1406,43 @@ export default function App() {
 
   const handleAdminResetCatalog = useCallback(async (): Promise<boolean> => {
     playClickSound();
+    catalogSyncSeqRef.current += 1;
+    const optimisticTs = Math.max(Date.now(), catalogUpdatedAtRef.current + 1);
     try {
       const res = await fetch('/api/admin/catalog', {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ reset: true }),
+        body: JSON.stringify({ reset: true, clientUpdatedAt: optimisticTs }),
       });
       const data = (await res.json()) as {
         ok?: boolean;
         catalog?: Record<string, ServiceCatalogOverrideItem[]>;
+        catalogUpdatedAt?: number;
+        catalogToken?: string | null;
       };
       if (!res.ok || !data.ok) {
         showToast('Reset failed ❌', true);
         return false;
       }
-      setLiveCatalog(mergeLiveCatalog(SERVICE_CATALOG, data.catalog ?? null));
+      const savedTs = Math.max(
+        optimisticTs,
+        typeof data.catalogUpdatedAt === 'number' ? data.catalogUpdatedAt : 0,
+      );
+      catalogUpdatedAtRef.current = savedTs;
+      catalogTokenRef.current = typeof data.catalogToken === 'string' ? data.catalogToken : '';
+      const merged = mergeLiveCatalog(SERVICE_CATALOG, data.catalog ?? null);
+      liveCatalogRef.current = merged;
+      liveCatalogJsonRef.current = serializeCatalogForDiff(merged);
+      setLiveCatalog(merged);
       try {
         localStorage.removeItem(STORAGE_LIVE_CATALOG_KEY);
+        localStorage.setItem(STORAGE_LIVE_CATALOG_UPDATED_AT_KEY, String(savedTs));
+        if (catalogTokenRef.current) {
+          localStorage.setItem(STORAGE_LIVE_CATALOG_TOKEN_KEY, catalogTokenRef.current);
+        } else {
+          localStorage.removeItem(STORAGE_LIVE_CATALOG_TOKEN_KEY);
+        }
       } catch {
         // Ignore storage errors
       }
@@ -1258,23 +1458,40 @@ export default function App() {
   const handleAdminSavePoster = useCallback(
     async (posterDataUrl: string | null): Promise<boolean> => {
       playClickSound();
+      catalogSyncSeqRef.current += 1;
+      const optimisticTs = Math.max(Date.now(), posterUpdatedAtRef.current + 1);
       try {
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (catalogTokenRef.current) {
+          headers['x-catalog-token'] = catalogTokenRef.current;
+        }
         const res = await fetch('/api/admin/poster', {
           method: 'POST',
           credentials: 'same-origin',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(posterDataUrl ? { posterImage: posterDataUrl } : { reset: true }),
+          headers,
+          body: JSON.stringify(
+            posterDataUrl
+              ? { posterImage: posterDataUrl, clientUpdatedAt: optimisticTs }
+              : { reset: true, clientUpdatedAt: optimisticTs },
+          ),
         });
         const data = (await res.json()) as {
           ok?: boolean;
           posterImage?: string | null;
+          posterUpdatedAt?: number;
           message?: string;
         };
         if (!res.ok || !data.ok) {
           showToast(data.message || 'Poster update failed ❌', true);
           return false;
         }
+        const savedTs = Math.max(
+          optimisticTs,
+          typeof data.posterUpdatedAt === 'number' ? data.posterUpdatedAt : 0,
+        );
+        posterUpdatedAtRef.current = savedTs;
         const nextPoster = typeof data.posterImage === 'string' ? data.posterImage : null;
+        livePosterRef.current = nextPoster;
         setLivePoster(nextPoster);
         try {
           if (nextPoster) {
@@ -1282,6 +1499,7 @@ export default function App() {
           } else {
             localStorage.removeItem(STORAGE_LIVE_POSTER_KEY);
           }
+          localStorage.setItem(STORAGE_LIVE_POSTER_UPDATED_AT_KEY, String(savedTs));
         } catch {
           // Ignore storage errors
         }

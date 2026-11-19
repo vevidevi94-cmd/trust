@@ -10,6 +10,8 @@ import {
   mergeAdminOrders,
   mergeLiveCatalog,
   parseHashPage,
+  reconcileCatalogDrafts,
+  shouldAdoptServerVersion,
   validateCatalogServiceEdit,
   validateDirectOrderInput,
   validatePaymentScreenshot,
@@ -347,4 +349,40 @@ test('validateCatalogServiceEdit enforces non-empty name and valid positive pric
     validateCatalogServiceEdit({ name: ' 5rs Reels ', prices: [{ q: ' 1K Views ', p: 5 }] }),
     { ok: true, name: '5rs Reels', prices: [{ q: '1K Views', p: 5 }] },
   );
+});
+
+test('shouldAdoptServerVersion prevents cold or stale server polls from reverting Admin edits', () => {
+  assert.equal(shouldAdoptServerVersion({ localUpdatedAt: 5000, serverUpdatedAt: 0 }), false);
+  assert.equal(shouldAdoptServerVersion({ localUpdatedAt: 5000, serverUpdatedAt: 4000 }), false);
+  assert.equal(shouldAdoptServerVersion({ localUpdatedAt: 5000, serverUpdatedAt: 5000 }), true);
+  assert.equal(shouldAdoptServerVersion({ localUpdatedAt: 5000, serverUpdatedAt: 6000 }), true);
+  assert.equal(shouldAdoptServerVersion({ localUpdatedAt: 0, serverUpdatedAt: 0 }), true);
+});
+
+test('reconcileCatalogDrafts preserves unsaved Admin edits while syncing clean services', () => {
+  const currentDrafts = [
+    {
+      id: 'ig-reels-1rs',
+      name: 'Typing New Name...',
+      prices: [{ q: '1K Reels Views', p: '9' }],
+    },
+    {
+      id: 'ig-bluetik',
+      name: 'OLD NAME',
+      prices: [{ q: 'BLUE TIK', p: '100' }],
+    },
+  ];
+  const incomingServices = SERVICE_CATALOG.instagram.slice(0, 2).map((s) =>
+    s.id === 'ig-bluetik' ? { ...s, name: 'UPDATED SERVER NAME' } : s,
+  );
+  const next = reconcileCatalogDrafts({
+    currentDrafts,
+    incomingServices,
+    dirtyServiceIds: new Set(['ig-reels-1rs']),
+  });
+  const dirtyReels = next.find((d) => d.id === 'ig-reels-1rs');
+  const cleanBlueTik = next.find((d) => d.id === 'ig-bluetik');
+  assert.equal(dirtyReels?.name, 'Typing New Name...');
+  assert.equal(dirtyReels?.prices[0].p, '9');
+  assert.equal(cleanBlueTik?.name, 'UPDATED SERVER NAME');
 });

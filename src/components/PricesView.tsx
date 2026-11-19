@@ -263,7 +263,7 @@ export function PricesView({
           const isActive = selectedIdx === idx;
           return (
             <button
-              key={pr.q}
+              key={`${idx}-${pr.q}`}
               type="button"
               onClick={() => setSelectedIdx(idx)}
               aria-pressed={isActive}

@@ -12,7 +12,11 @@ import {
   type CategoryKey,
   type ServiceItem,
 } from '../data/services';
-import { validateCatalogServiceEdit } from '../utils/panelLogic';
+import {
+  reconcileCatalogDrafts,
+  validateCatalogServiceEdit,
+  type CatalogDraftService,
+} from '../utils/panelLogic';
 
 interface AdminCatalogEditorProps {
   catalog: Record<CategoryKey, ServiceItem[]>;
@@ -23,11 +27,7 @@ interface AdminCatalogEditorProps {
   onShowToast: (message: string, isError?: boolean) => void;
 }
 
-interface DraftService {
-  id: string;
-  name: string;
-  prices: Array<{ q: string; p: string }>;
-}
+type DraftService = CatalogDraftService;
 
 function compressPosterImage(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -42,7 +42,7 @@ function compressPosterImage(file: File): Promise<string> {
       const img = new Image();
       img.onerror = () => resolve(rawUrl);
       img.onload = () => {
-        const maxWidth = 1080;
+        const maxWidth = 960;
         let { width, height } = img;
         if (width > maxWidth) {
           const ratio = maxWidth / width;
@@ -58,8 +58,12 @@ function compressPosterImage(file: File): Promise<string> {
           return;
         }
         ctx.drawImage(img, 0, 0, width, height);
-        const compressed = canvas.toDataURL('image/jpeg', 0.84);
-        resolve(compressed.length < rawUrl.length ? compressed : rawUrl);
+        let compressed = canvas.toDataURL('image/jpeg', 0.82);
+        // Step down quality if needed so poster always stays compact for fast live sync & localStorage
+        if (compressed.length > 550_000) {
+          compressed = canvas.toDataURL('image/jpeg', 0.68);
+        }
+        resolve(compressed.length < rawUrl.length || rawUrl.length > 600_000 ? compressed : rawUrl);
       };
       img.src = rawUrl;
     };
@@ -87,15 +91,30 @@ export function AdminCatalogEditor({
   const [drafts, setDrafts] = useState<DraftService[]>(() =>
     buildDraftsForCategory(catalog.instagram),
   );
+  const [dirtyIds, setDirtyIds] = useState<Set<string>>(() => new Set());
   const [savingServiceId, setSavingServiceId] = useState<string | null>(null);
   const [resettingAll, setResettingAll] = useState(false);
 
   const [pendingPosterUrl, setPendingPosterUrl] = useState<string | null>(null);
   const [savingPoster, setSavingPoster] = useState(false);
 
+  // When switching category tabs, load clean drafts for the chosen category
+  const handleSelectCategory = (cat: CategoryKey) => {
+    setSelectedCat(cat);
+    setDirtyIds(new Set());
+    setDrafts(buildDraftsForCategory(catalog[cat]));
+  };
+
+  // Reconcile incoming live catalog updates WITHOUT overwriting any service Admin is actively editing
   useEffect(() => {
-    setDrafts(buildDraftsForCategory(catalog[selectedCat]));
-  }, [catalog, selectedCat]);
+    setDrafts((prev) =>
+      reconcileCatalogDrafts({
+        currentDrafts: prev,
+        incomingServices: catalog[selectedCat],
+        dirtyServiceIds: dirtyIds,
+      }),
+    );
+  }, [catalog, selectedCat, dirtyIds]);
 
   const displayedPoster = pendingPosterUrl || posterImage || POSTER_IMAGE_PATH;
 
@@ -133,7 +152,17 @@ export function AdminCatalogEditor({
     }
   };
 
+  const markDirty = (serviceId: string) => {
+    setDirtyIds((prev) => {
+      if (prev.has(serviceId)) return prev;
+      const next = new Set(prev);
+      next.add(serviceId);
+      return next;
+    });
+  };
+
   const updateServiceName = (serviceId: string, name: string) => {
+    markDirty(serviceId);
     setDrafts((prev) =>
       prev.map((d) => (d.id === serviceId ? { ...d, name } : d)),
     );
@@ -145,6 +174,7 @@ export function AdminCatalogEditor({
     field: 'q' | 'p',
     value: string,
   ) => {
+    markDirty(serviceId);
     setDrafts((prev) =>
       prev.map((d) =>
         d.id === serviceId
@@ -160,6 +190,7 @@ export function AdminCatalogEditor({
   };
 
   const addTier = (serviceId: string) => {
+    markDirty(serviceId);
     setDrafts((prev) =>
       prev.map((d) =>
         d.id === serviceId
@@ -170,6 +201,7 @@ export function AdminCatalogEditor({
   };
 
   const removeTier = (serviceId: string, tierIdx: number) => {
+    markDirty(serviceId);
     setDrafts((prev) =>
       prev.map((d) =>
         d.id === serviceId && d.prices.length > 1
@@ -199,14 +231,25 @@ export function AdminCatalogEditor({
     };
 
     setSavingServiceId(draft.id);
-    await onSaveCatalog(updatedCatalog);
+    const ok = await onSaveCatalog(updatedCatalog);
     setSavingServiceId(null);
+    if (ok) {
+      setDirtyIds((prev) => {
+        if (!prev.has(draft.id)) return prev;
+        const next = new Set(prev);
+        next.delete(draft.id);
+        return next;
+      });
+    }
   };
 
   const handleResetAllServices = async () => {
     setResettingAll(true);
-    await onResetCatalog();
+    const ok = await onResetCatalog();
     setResettingAll(false);
+    if (ok) {
+      setDirtyIds(new Set());
+    }
   };
 
   return (
@@ -277,7 +320,7 @@ export function AdminCatalogEditor({
               key={cat.key}
               type="button"
               aria-pressed={active}
-              onClick={() => setSelectedCat(cat.key)}
+              onClick={() => handleSelectCategory(cat.key)}
               className={`py-2 px-1 rounded-[12px] text-[11.5px] font-extrabold cursor-pointer transition-colors ${
                 active
                   ? 'bg-[#7c4dff] text-white shadow-sm'

@@ -14,6 +14,11 @@ const UPI_PAYEE_NAME = process.env.UPI_PAYEE_NAME || 'TrustedPanel';
 const FIREBASE_RTDB_URL =
   process.env.FIREBASE_RTDB_URL ||
   'https://trusted-91b2d-default-rtdb.asia-southeast1.firebasedatabase.app';
+const FIREBASE_RTDB_AUTH = process.env.FIREBASE_RTDB_AUTH || '';
+const KV_REST_API_URL =
+  process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL || '';
+const KV_REST_API_TOKEN =
+  process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN || '';
 
 const SESSION_SECRET = process.env.SESSION_SECRET
   ? crypto.createHash('sha256').update(process.env.SESSION_SECRET).digest()
@@ -230,7 +235,9 @@ interface StoreData {
   notifications: StoredNotification[];
   orderCounter: number;
   catalogOverrides?: Record<string, ServerServiceItem[]>;
+  catalogUpdatedAt: number;
   posterImage?: string | null;
+  posterUpdatedAt: number;
 }
 
 function cloneDefaultCatalog(): Record<string, ServerServiceItem[]> {
@@ -425,13 +432,25 @@ function loadStore(): StoreData {
           parsed.catalogOverrides && typeof parsed.catalogOverrides === 'object'
             ? parsed.catalogOverrides
             : undefined,
+        catalogUpdatedAt:
+          typeof parsed.catalogUpdatedAt === 'number' ? parsed.catalogUpdatedAt : 0,
         posterImage: typeof parsed.posterImage === 'string' ? parsed.posterImage : null,
+        posterUpdatedAt:
+          typeof parsed.posterUpdatedAt === 'number' ? parsed.posterUpdatedAt : 0,
       };
     }
   } catch {
     // Fallback to clean store
   }
-  return { knownUsers: {}, orders: [], notifications: [], orderCounter: 1, posterImage: null };
+  return {
+    knownUsers: {},
+    orders: [],
+    notifications: [],
+    orderCounter: 1,
+    catalogUpdatedAt: 0,
+    posterImage: null,
+    posterUpdatedAt: 0,
+  };
 }
 
 function saveStore(store: StoreData): void {
@@ -445,15 +464,94 @@ function saveStore(store: StoreData): void {
   }
 }
 
+function buildFirebaseUrl(subPath: string): string {
+  const base = `${FIREBASE_RTDB_URL}/${subPath}.json`;
+  return FIREBASE_RTDB_AUTH ? `${base}?auth=${encodeURIComponent(FIREBASE_RTDB_AUTH)}` : base;
+}
+
+let firebaseBlockedUntilMs = 0;
+
 async function syncToFirebase(subPath: string, payload: unknown): Promise<void> {
+  if (Date.now() < firebaseBlockedUntilMs) return;
   try {
-    await fetch(`${FIREBASE_RTDB_URL}/${subPath}.json`, {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 1800);
+    const res = await fetch(buildFirebaseUrl(subPath), {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
+      signal: controller.signal,
     });
+    clearTimeout(timer);
+    if (res.status === 401 || res.status === 403) {
+      firebaseBlockedUntilMs = Date.now() + 60_000;
+    }
   } catch {
     // Firebase RTDB rules may reject unauthenticated REST writes
+  }
+}
+
+async function readFromFirebase<T>(subPath: string): Promise<T | null> {
+  if (Date.now() < firebaseBlockedUntilMs) return null;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 1600);
+    const res = await fetch(buildFirebaseUrl(subPath), {
+      method: 'GET',
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    if (res.status === 401 || res.status === 403) {
+      firebaseBlockedUntilMs = Date.now() + 60_000;
+      return null;
+    }
+    if (!res.ok) return null;
+    return (await res.json()) as T;
+  } catch {
+    return null;
+  }
+}
+
+async function writeToKv(key: string, payload: unknown): Promise<void> {
+  if (!KV_REST_API_URL || !KV_REST_API_TOKEN) return;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 1800);
+    await fetch(`${KV_REST_API_URL.replace(/\/+$/, '')}/set/${encodeURIComponent(key)}`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${KV_REST_API_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+  } catch {
+    // Ignore transient KV errors
+  }
+}
+
+async function readFromKv<T>(key: string): Promise<T | null> {
+  if (!KV_REST_API_URL || !KV_REST_API_TOKEN) return null;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 1600);
+    const res = await fetch(`${KV_REST_API_URL.replace(/\/+$/, '')}/get/${encodeURIComponent(key)}`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${KV_REST_API_TOKEN}` },
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    if (!res.ok) return null;
+    const body = (await res.json()) as { result?: unknown };
+    if (!body || body.result == null) return null;
+    if (typeof body.result === 'string') {
+      return JSON.parse(body.result) as T;
+    }
+    return body.result as T;
+  } catch {
+    return null;
   }
 }
 
@@ -717,12 +815,114 @@ export function createApiApp() {
     }
   }
 
+  // Hydrate cold serverless instance from server-signed HMAC catalog proof header if newer
+  function hydrateCatalogFromSignedHeader(req: Request): void {
+    const token =
+      typeof req.headers['x-catalog-token'] === 'string' ? req.headers['x-catalog-token'] : '';
+    if (!token) return;
+    const verified = verifyToken<{
+      catalog?: Record<string, ServerServiceItem[]> | null;
+      updatedAt?: number;
+    }>(token);
+    if (!verified || typeof verified.updatedAt !== 'number') return;
+    if (verified.updatedAt > store.catalogUpdatedAt) {
+      store.catalogOverrides =
+        verified.catalog && typeof verified.catalog === 'object' ? verified.catalog : undefined;
+      store.catalogUpdatedAt = verified.updatedAt;
+      saveStore(store);
+    }
+  }
+
+  let lastRemoteConfigSyncMs = 0;
+  async function syncConfigFromFirebaseIfStale(): Promise<void> {
+    const now = Date.now();
+    if (now - lastRemoteConfigSyncMs < 1500) return;
+    lastRemoteConfigSyncMs = now;
+
+    const [kvCatalog, kvPoster, fbCatalog, fbPoster] = await Promise.all([
+      readFromKv<{ catalog?: Record<string, ServerServiceItem[]> | null; catalogUpdatedAt?: number }>(
+        'tp:config:catalog',
+      ),
+      readFromKv<{ posterImage?: string | null; posterUpdatedAt?: number }>('tp:config:poster'),
+      readFromFirebase<{ catalog?: Record<string, ServerServiceItem[]> | null; catalogUpdatedAt?: number }>(
+        'config/catalog',
+      ),
+      readFromFirebase<{ posterImage?: string | null; posterUpdatedAt?: number }>('config/poster'),
+    ]);
+
+    let changed = false;
+    for (const remoteCat of [kvCatalog, fbCatalog]) {
+      if (
+        remoteCat &&
+        typeof remoteCat.catalogUpdatedAt === 'number' &&
+        remoteCat.catalogUpdatedAt > store.catalogUpdatedAt
+      ) {
+        store.catalogOverrides =
+          remoteCat.catalog && typeof remoteCat.catalog === 'object'
+            ? remoteCat.catalog
+            : undefined;
+        store.catalogUpdatedAt = remoteCat.catalogUpdatedAt;
+        changed = true;
+      }
+    }
+
+    for (const remotePoster of [kvPoster, fbPoster]) {
+      if (
+        remotePoster &&
+        typeof remotePoster.posterUpdatedAt === 'number' &&
+        remotePoster.posterUpdatedAt > store.posterUpdatedAt
+      ) {
+        store.posterImage =
+          typeof remotePoster.posterImage === 'string' ? remotePoster.posterImage : null;
+        store.posterUpdatedAt = remotePoster.posterUpdatedAt;
+        changed = true;
+      }
+    }
+
+    if (changed) saveStore(store);
+  }
+
+  async function persistCatalogRemote(): Promise<void> {
+    const payload = {
+      catalog: store.catalogOverrides ?? null,
+      catalogUpdatedAt: store.catalogUpdatedAt,
+    };
+    await Promise.all([
+      writeToKv('tp:config:catalog', payload),
+      syncToFirebase('config/catalog', payload),
+    ]);
+  }
+
+  async function persistPosterRemote(): Promise<void> {
+    const payload = {
+      posterImage: store.posterImage ?? null,
+      posterUpdatedAt: store.posterUpdatedAt,
+    };
+    await Promise.all([
+      writeToKv('tp:config:poster', payload),
+      syncToFirebase('config/poster', payload),
+    ]);
+  }
+
+  function makeCatalogToken(): string | null {
+    if (!store.catalogUpdatedAt) return null;
+    return signToken({
+      catalog: store.catalogOverrides ?? null,
+      updatedAt: store.catalogUpdatedAt,
+    });
+  }
+
   // Public live catalog & poster endpoint (reflects Admin edits immediately)
-  app.get('/api/catalog', (_req, res) => {
+  app.get('/api/catalog', async (req, res) => {
+    hydrateCatalogFromSignedHeader(req);
+    await syncConfigFromFirebaseIfStale();
     res.json({
       ok: true,
       catalog: getLiveCatalog(store),
+      catalogUpdatedAt: store.catalogUpdatedAt,
+      catalogToken: makeCatalogToken(),
       posterImage: store.posterImage || null,
+      posterUpdatedAt: store.posterUpdatedAt,
     });
   });
 
@@ -861,8 +1061,10 @@ export function createApiApp() {
   });
 
   // Validate service + link & issue single-use QR token for direct order payment
-  app.post('/api/order/checkout', (req, res) => {
+  app.post('/api/order/checkout', async (req, res) => {
     pruneTokens();
+    hydrateCatalogFromSignedHeader(req);
+    await syncConfigFromFirebaseIfStale();
     const session = getOrIssueUserSession(req, res, store);
     const category = String(req.body?.category || '').trim();
     const serviceId = String(req.body?.serviceId || '').trim();
@@ -965,6 +1167,8 @@ export function createApiApp() {
 
   // Direct order placement with payment screenshot (uses live Admin-configured prices)
   app.post('/api/orders', async (req, res) => {
+    hydrateCatalogFromSignedHeader(req);
+    await syncConfigFromFirebaseIfStale();
     const session = getOrIssueUserSession(req, res, store);
     const category = String(req.body?.category || '').trim();
     const serviceId = String(req.body?.serviceId || '').trim();
@@ -1279,20 +1483,25 @@ export function createApiApp() {
   });
 
   // Admin edits live service names, packages & prices (auto-updates scanner amount too)
-  app.post('/api/admin/catalog', (req, res) => {
+  app.post('/api/admin/catalog', async (req, res) => {
     if (!isAdminAuthenticated(req)) {
       res.status(401).json({ ok: false, message: 'Unauthorized' });
       return;
     }
 
+    const clientTs = Number(req.body?.clientUpdatedAt) || 0;
+    const now = Math.max(Date.now(), clientTs, store.catalogUpdatedAt + 1);
+
     if (req.body?.reset === true) {
       store.catalogOverrides = undefined;
+      store.catalogUpdatedAt = now;
       saveStore(store);
       const liveCatalog = getLiveCatalog(store);
-      broadcastToAdmins('catalog_updated', { ts: Date.now() });
-      broadcastToAllUsers('catalog_updated', { ts: Date.now() });
-      void syncToFirebase('config/catalog', liveCatalog);
-      res.json({ ok: true, catalog: liveCatalog });
+      const catalogToken = makeCatalogToken();
+      await persistCatalogRemote();
+      broadcastToAdmins('catalog_updated', { ts: now });
+      broadcastToAllUsers('catalog_updated', { ts: now });
+      res.json({ ok: true, catalog: liveCatalog, catalogUpdatedAt: store.catalogUpdatedAt, catalogToken });
       return;
     }
 
@@ -1339,30 +1548,37 @@ export function createApiApp() {
     }
 
     store.catalogOverrides = nextOverrides;
+    store.catalogUpdatedAt = now;
     saveStore(store);
     const liveCatalog = getLiveCatalog(store);
+    const catalogToken = makeCatalogToken();
+    await persistCatalogRemote();
 
-    broadcastToAdmins('catalog_updated', { ts: Date.now() });
-    broadcastToAllUsers('catalog_updated', { ts: Date.now() });
-    void syncToFirebase('config/catalog', liveCatalog);
+    broadcastToAdmins('catalog_updated', { ts: now });
+    broadcastToAllUsers('catalog_updated', { ts: now });
 
-    res.json({ ok: true, catalog: liveCatalog });
+    res.json({ ok: true, catalog: liveCatalog, catalogUpdatedAt: store.catalogUpdatedAt, catalogToken });
   });
 
   // Admin changes Home Offer Poster live (or resets to default)
-  app.post('/api/admin/poster', (req, res) => {
+  app.post('/api/admin/poster', async (req, res) => {
     if (!isAdminAuthenticated(req)) {
       res.status(401).json({ ok: false, message: 'Unauthorized' });
       return;
     }
 
+    hydrateCatalogFromSignedHeader(req);
+    const clientTs = Number(req.body?.clientUpdatedAt) || 0;
+    const now = Math.max(Date.now(), clientTs, store.posterUpdatedAt + 1);
+
     if (req.body?.reset === true || req.body?.posterImage === null) {
       store.posterImage = null;
+      store.posterUpdatedAt = now;
       saveStore(store);
-      broadcastToAdmins('catalog_updated', { ts: Date.now() });
-      broadcastToAllUsers('catalog_updated', { ts: Date.now() });
-      void syncToFirebase('config/poster', null);
-      res.json({ ok: true, posterImage: null });
+      await persistPosterRemote();
+      broadcastToAdmins('catalog_updated', { ts: now });
+      broadcastToAllUsers('catalog_updated', { ts: now });
+      res.json({ ok: true, posterImage: null, posterUpdatedAt: store.posterUpdatedAt });
       return;
     }
 
@@ -1373,12 +1589,13 @@ export function createApiApp() {
     }
 
     store.posterImage = imgCheck.dataUrl;
+    store.posterUpdatedAt = now;
     saveStore(store);
-    broadcastToAdmins('catalog_updated', { ts: Date.now() });
-    broadcastToAllUsers('catalog_updated', { ts: Date.now() });
-    void syncToFirebase('config/poster', store.posterImage);
+    await persistPosterRemote();
+    broadcastToAdmins('catalog_updated', { ts: now });
+    broadcastToAllUsers('catalog_updated', { ts: now });
 
-    res.json({ ok: true, posterImage: store.posterImage });
+    res.json({ ok: true, posterImage: store.posterImage, posterUpdatedAt: store.posterUpdatedAt });
   });
 
   return app;

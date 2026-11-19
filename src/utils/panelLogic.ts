@@ -377,3 +377,41 @@ export function validateCatalogServiceEdit(params: {
   }
   return { ok: true, name, prices: cleaned };
 }
+
+export function shouldAdoptServerVersion(params: {
+  localUpdatedAt: number;
+  serverUpdatedAt: number;
+}): boolean {
+  const localTs = Number.isFinite(params.localUpdatedAt) ? params.localUpdatedAt : 0;
+  const serverTs = Number.isFinite(params.serverUpdatedAt) ? params.serverUpdatedAt : 0;
+  // Never let a cold/stale server response overwrite a newer saved Admin edit
+  if (localTs > 0 && serverTs < localTs) {
+    return false;
+  }
+  return serverTs >= localTs;
+}
+
+export interface CatalogDraftService {
+  id: string;
+  name: string;
+  prices: Array<{ q: string; p: string }>;
+}
+
+export function reconcileCatalogDrafts(params: {
+  currentDrafts: CatalogDraftService[];
+  incomingServices: ServiceItem[];
+  dirtyServiceIds: Set<string>;
+}): CatalogDraftService[] {
+  const currentById = new Map(params.currentDrafts.map((d) => [d.id, d]));
+  return params.incomingServices.map((svc) => {
+    const existing = currentById.get(svc.id);
+    if (existing && params.dirtyServiceIds.has(svc.id)) {
+      return existing;
+    }
+    return {
+      id: svc.id,
+      name: svc.name,
+      prices: svc.prices.map((t) => ({ q: t.q, p: String(t.p) })),
+    };
+  });
+}
