@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Copy, Lock, ReceiptText, ShieldCheck, Wallet, X } from 'lucide-react';
+import { Copy, Lock, ReceiptText, ShieldCheck, X } from 'lucide-react';
 import { PlatformIcon } from './BrandIcons';
 
 interface MenuViewProps {
@@ -13,7 +13,6 @@ interface MenuViewProps {
   onCopyUid: () => void;
   onSupportClick: () => void;
   onGoOrders: () => void;
-  onGoFund: () => void;
 }
 
 export function MenuView({
@@ -27,7 +26,6 @@ export function MenuView({
   onCopyUid,
   onSupportClick,
   onGoOrders,
-  onGoFund,
 }: MenuViewProps) {
   const [password, setPassword] = useState('');
   const [verifying, setVerifying] = useState(false);
@@ -102,22 +100,6 @@ export function MenuView({
               <ReceiptText className="w-[22px] h-[22px] text-[#7c4dff]" aria-hidden="true" />
             </div>
             <span className="text-[16px] text-[#2d1b4e] font-bold">My Orders</span>
-          </div>
-          <span className="text-[#7c4dff] text-[24px] font-extrabold leading-none" aria-hidden="true">
-            ›
-          </span>
-        </button>
-
-        <button
-          type="button"
-          onClick={onGoFund}
-          className="w-full bg-white rounded-[22px] p-[16px] flex justify-between items-center shadow-[0_8px_20px_rgba(60,20,120,0.08)] cursor-pointer transition-transform duration-150 active:scale-[0.97] text-left focus-visible:outline-2 focus-visible:outline-[#7c4dff]"
-        >
-          <div className="flex items-center gap-[12px]">
-            <div className="w-[46px] h-[46px] bg-[#fff7e0] rounded-[12px] flex items-center justify-center shrink-0">
-              <Wallet className="w-[22px] h-[22px] text-[#ff9800]" aria-hidden="true" />
-            </div>
-            <span className="text-[16px] text-[#2d1b4e] font-bold">Add Funds</span>
           </div>
           <span className="text-[#7c4dff] text-[24px] font-extrabold leading-none" aria-hidden="true">
             ›

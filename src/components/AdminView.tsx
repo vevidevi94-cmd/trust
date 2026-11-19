@@ -1,50 +1,70 @@
 import React, { useState } from 'react';
-import { BellRing, CheckCircle2, Eye, LogOut, X, XCircle } from 'lucide-react';
-import type { OrderItem, PaymentFundRequest } from '../data/services';
 import {
-  formatIndianDateTime,
-  getOrderStatusBadgeStyle,
-  getPaymentStatusBadgeStyle,
-} from '../utils/panelLogic';
+  BellRing,
+  Check,
+  CheckCircle2,
+  Clock,
+  Copy,
+  Eye,
+  LogOut,
+  Trash2,
+  X,
+  XCircle,
+} from 'lucide-react';
+import type { OrderItem } from '../data/services';
+import { formatIndianDateTime, getOrderStatusBadgeStyle } from '../utils/panelLogic';
 
 interface AdminViewProps {
-  paymentRequests: PaymentFundRequest[];
   orders: OrderItem[];
   onBack: () => void;
   onLogout: () => void;
-  onPaymentAction: (params: {
-    id: string;
-    action: 'approve' | 'wrong_payment';
+  onOrderStatusChange: (params: {
+    orderId: string;
+    status: 'successful' | 'pending' | 'payment_failed';
     note?: string;
   }) => Promise<void>;
-  onOrderStatusChange: (orderId: string, status: string) => Promise<void>;
+  onDeleteOrder: (orderId: string) => Promise<void>;
   onTestSound: () => void;
 }
 
 export function AdminView({
-  paymentRequests,
   orders,
   onBack,
   onLogout,
-  onPaymentAction,
   onOrderStatusChange,
+  onDeleteOrder,
   onTestSound,
 }: AdminViewProps) {
-  const [tab, setTab] = useState<'payments' | 'orders'>('payments');
   const [busyId, setBusyId] = useState<string | null>(null);
   const [notesById, setNotesById] = useState<Record<string, string>>({});
   const [previewImg, setPreviewImg] = useState<string | null>(null);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
 
-  const pendingCount = paymentRequests.filter((r) => r.status === 'pending').length;
+  const pendingCount = orders.filter((o) => o.status.toLowerCase() === 'pending').length;
 
-  const handleAction = async (id: string, action: 'approve' | 'wrong_payment') => {
-    setBusyId(id);
-    await onPaymentAction({
-      id,
-      action,
-      note: notesById[id]?.trim() || undefined,
+  const handleStatusClick = async (
+    orderId: string,
+    status: 'successful' | 'pending' | 'payment_failed',
+  ) => {
+    setBusyId(orderId);
+    await onOrderStatusChange({
+      orderId,
+      status,
+      note: notesById[orderId]?.trim() || undefined,
     });
     setBusyId(null);
+  };
+
+  const handleDeleteClick = async (orderId: string) => {
+    setBusyId(orderId);
+    await onDeleteOrder(orderId);
+    setBusyId(null);
+  };
+
+  const handleCopyLink = (orderId: string, link: string) => {
+    navigator.clipboard?.writeText(link).catch(() => {});
+    setCopiedId(orderId);
+    window.setTimeout(() => setCopiedId((prev) => (prev === orderId ? null : prev)), 1800);
   };
 
   return (
@@ -82,232 +102,157 @@ export function AdminView({
 
       <h1
         id="admin-panel-heading"
-        className="text-[28px] font-extrabold text-[#3a1d6d] text-center my-[10px] mb-[14px]"
+        className="text-[28px] font-extrabold text-[#3a1d6d] text-center my-[10px] mb-[6px]"
       >
         Admin Panel
       </h1>
 
-      <div className="grid grid-cols-2 gap-2 p-1.5 bg-white rounded-[16px] shadow-[0_4px_12px_rgba(60,20,120,0.08)] mb-4">
-        <button
-          type="button"
-          onClick={() => setTab('payments')}
-          className={`py-2.5 px-2 rounded-[12px] text-[12.5px] font-extrabold cursor-pointer transition-colors whitespace-nowrap ${
-            tab === 'payments' ? 'bg-[#7c4dff] text-white' : 'text-[#3a1d6d] hover:bg-[#f3edff]'
-          }`}
-        >
-          Payments ({pendingCount} Pending)
-        </button>
-        <button
-          type="button"
-          onClick={() => setTab('orders')}
-          className={`py-2.5 px-2 rounded-[12px] text-[12.5px] font-extrabold cursor-pointer transition-colors whitespace-nowrap ${
-            tab === 'orders' ? 'bg-[#7c4dff] text-white' : 'text-[#3a1d6d] hover:bg-[#f3edff]'
-          }`}
-        >
-          All Orders ({orders.length})
-        </button>
+      <div className="text-center text-[12.5px] font-bold text-[#3a1d6d] mb-3">
+        Live Orders: {orders.length} ({pendingCount} Pending)
       </div>
 
-      {tab === 'payments' && (
-        <div className="space-y-3" data-testid="admin-payment-list">
-          {paymentRequests.length === 0 ? (
-            <div className="bg-white rounded-[18px] p-6 text-center text-[#555] text-[14px]">
-              Abhi koi payment screenshot request nahi aayi hai.
-            </div>
-          ) : (
-            paymentRequests.map((req) => {
-              const badge = getPaymentStatusBadgeStyle(req.status);
-              const isBusy = busyId === req.id;
-              return (
-                <div
-                  key={req.id}
-                  className="bg-white rounded-[18px] p-[14px] shadow-[0_6px_16px_rgba(60,20,120,0.08)] border-l-4 border-[#7c4dff]"
-                >
-                  <div className="flex justify-between items-start gap-2">
-                    <div>
-                      <div className="text-[13px] font-extrabold text-[#3a1d6d]">
-                        {req.uid} • {req.app}
-                      </div>
-                      <div className="text-[20px] font-extrabold text-[#7c4dff] tabular-nums">
-                        ₹{req.amount.toFixed(2)}
-                      </div>
-                    </div>
-                    <span
-                      style={{ backgroundColor: badge.bg, color: badge.color }}
-                      className="px-[9px] py-[4px] rounded-[10px] text-[11px] font-extrabold whitespace-nowrap shrink-0"
-                    >
-                      {badge.label}
-                    </span>
-                  </div>
-
-                  {req.screenshot && (
-                    <div className="mt-2 bg-[#f8f5ff] border border-[#e9dffc] rounded-[12px] p-2">
-                      <div className="flex items-center justify-between mb-1.5">
-                        <span className="text-[12px] font-extrabold text-[#3a1d6d]">
-                          Payment Screenshot:
-                        </span>
-                        <button
-                          type="button"
-                          onClick={() => setPreviewImg(req.screenshot!)}
-                          className="text-[11px] font-bold text-[#7c4dff] inline-flex items-center gap-1 cursor-pointer"
-                        >
-                          <Eye className="w-3.5 h-3.5" />
-                          <span>View Full</span>
-                        </button>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => setPreviewImg(req.screenshot!)}
-                        className="w-full block cursor-pointer"
-                      >
-                        <img
-                          src={req.screenshot}
-                          alt={`Payment screenshot from ${req.uid}`}
-                          className="w-full max-h-48 object-contain rounded-[8px] bg-white border border-[#e9dffc]"
-                        />
-                      </button>
-                    </div>
-                  )}
-
-                  <div className="text-[11px] text-[#666] mt-1.5 tabular-nums">
-                    {req.createdAt ? formatIndianDateTime(req.createdAt) : req.date}
-                  </div>
-
-                  {req.status === 'pending' ? (
-                    <div className="mt-3 space-y-2">
-                      <input
-                        type="text"
-                        value={notesById[req.id] || ''}
-                        onChange={(e) =>
-                          setNotesById((prev) => ({ ...prev, [req.id]: e.target.value }))
-                        }
-                        placeholder="Optional message (e.g. Fake Screenshot / Fund Added)"
-                        className="w-full px-3 py-2 text-[12px] border border-[#e9dffc] rounded-[10px] outline-none focus:border-[#7c4dff]"
-                      />
-                      <div className="grid grid-cols-2 gap-2">
-                        <button
-                          type="button"
-                          disabled={isBusy}
-                          onClick={() => handleAction(req.id, 'approve')}
-                          className="bg-[#2e7d32] text-white py-2.5 px-2.5 rounded-[12px] text-[12px] font-extrabold inline-flex items-center justify-center gap-1 cursor-pointer disabled:opacity-60 active:scale-[0.98] whitespace-nowrap"
-                        >
-                          <CheckCircle2 className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-                          <span>Add Fund ✅</span>
-                        </button>
-                        <button
-                          type="button"
-                          disabled={isBusy}
-                          onClick={() => handleAction(req.id, 'wrong_payment')}
-                          className="bg-[#c62828] text-white py-2.5 px-2.5 rounded-[12px] text-[12px] font-extrabold inline-flex items-center justify-center gap-1 cursor-pointer disabled:opacity-60 active:scale-[0.98] whitespace-nowrap"
-                        >
-                          <XCircle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-                          <span>Wrong Payment ❌</span>
-                        </button>
-                      </div>
-                    </div>
-                  ) : (
-                    req.adminMessage && (
-                      <div className="mt-2 text-[12px] font-semibold text-[#555]">
-                        Note: {req.adminMessage}
-                      </div>
-                    )
-                  )}
-                </div>
-              );
-            })
-          )}
-        </div>
-      )}
-
-      {tab === 'orders' && (
-        <div className="space-y-3" data-testid="admin-orders-list">
-          {orders.length === 0 ? (
-            <div className="bg-white rounded-[18px] p-6 text-center text-[#555] text-[14px]">
-              Abhi koi order nahi aaya hai.
-            </div>
-          ) : (
-            orders.map((order) => {
-              const badge = getOrderStatusBadgeStyle(order.status);
-              return (
-                <div
-                  key={order.order_id}
-                  className="bg-white rounded-[18px] p-[14px] shadow-[0_6px_16px_rgba(60,20,120,0.08)] border-l-4 border-[#7c4dff]"
-                >
-                  <div className="flex justify-between items-start gap-2">
-                    <strong className="text-[14px] text-[#2d1b4e]">
+      <div className="space-y-3" data-testid="admin-orders-list">
+        {orders.length === 0 ? (
+          <div className="bg-white rounded-[18px] p-6 text-center text-[#555] text-[14px]">
+            Abhi koi live order notification nahi aayi hai.
+          </div>
+        ) : (
+          orders.map((order) => {
+            const badge = getOrderStatusBadgeStyle(order.status);
+            const isBusy = busyId === order.order_id;
+            const isCopied = copiedId === order.order_id;
+            return (
+              <div
+                key={order.order_id}
+                className="bg-white rounded-[18px] p-[14px] shadow-[0_6px_16px_rgba(60,20,120,0.08)] border-l-4 border-[#7c4dff]"
+              >
+                <div className="flex justify-between items-start gap-2">
+                  <div className="min-w-0">
+                    <strong className="text-[14px] text-[#2d1b4e] block">
                       #{order.id} {order.service}
                     </strong>
+                    <div className="text-[12px] font-bold text-[#3a1d6d] mt-0.5 tabular-nums">
+                      {order.uid} • {order.pack} •{' '}
+                      <span className="text-[#7c4dff]">₹{order.price}</span>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1.5 shrink-0">
                     <span
                       style={{ backgroundColor: badge.bg, color: badge.color }}
-                      className="px-[8px] py-[3px] rounded-[10px] text-[11px] font-extrabold whitespace-nowrap shrink-0"
+                      className="px-[8px] py-[3px] rounded-[10px] text-[10.5px] font-extrabold whitespace-nowrap"
                     >
                       {badge.label}
                     </span>
+                    <button
+                      type="button"
+                      disabled={isBusy}
+                      aria-label={`Delete Order #${order.id}`}
+                      onClick={() => handleDeleteClick(order.order_id)}
+                      className="w-7 h-7 rounded-[8px] bg-[#ffebee] text-[#c62828] flex items-center justify-center cursor-pointer hover:bg-[#ffcdd2] disabled:opacity-50"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" aria-hidden="true" />
+                    </button>
                   </div>
+                </div>
 
-                  <div className="text-[12px] font-bold text-[#3a1d6d] mt-1">
-                    User: {order.uid} • {order.pack} • ₹{order.price}
-                  </div>
-                  <div className="text-[12px] text-[#7c4dff] break-all mt-0.5">
+                <div className="mt-2 bg-[#f8f5ff] border border-[#e9dffc] rounded-[10px] px-2.5 py-2 flex items-start justify-between gap-2">
+                  <a
+                    href={/^https?:\/\//i.test(order.link) ? order.link : `https://${order.link}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-[12px] font-bold text-[#7c4dff] break-all underline"
+                  >
                     {order.link}
-                  </div>
+                  </a>
+                  <button
+                    type="button"
+                    onClick={() => handleCopyLink(order.order_id, order.link)}
+                    className="inline-flex items-center gap-1 text-[11px] font-bold text-[#3a1d6d] bg-white border border-[#e9dffc] px-2 py-1 rounded-[8px] cursor-pointer shrink-0"
+                  >
+                    {isCopied ? <Check className="w-3 h-3 text-[#2e7d32]" /> : <Copy className="w-3 h-3" />}
+                    <span>{isCopied ? 'Copied' : 'Copy'}</span>
+                  </button>
+                </div>
 
-                  {order.paymentScreenshot ? (
-                    <div className="mt-1.5 bg-[#f8f5ff] border border-[#e9dffc] rounded-[10px] p-2 flex items-center justify-between gap-2">
-                      <div className="flex items-center gap-2">
-                        <img
-                          src={order.paymentScreenshot}
-                          alt="Order payment screenshot"
-                          className="w-10 h-10 rounded-[6px] object-cover border border-[#e9dffc]"
-                        />
-                        <span className="text-[11px] font-bold text-[#3a1d6d]">
-                          Payment Screenshot
-                        </span>
-                      </div>
+                {order.paymentScreenshot && (
+                  <div className="mt-2 bg-[#f8f5ff] border border-[#e9dffc] rounded-[12px] p-2">
+                    <div className="flex items-center justify-between mb-1.5">
+                      <span className="text-[12px] font-extrabold text-[#3a1d6d]">
+                        Payment Screenshot:
+                      </span>
                       <button
                         type="button"
                         onClick={() => setPreviewImg(order.paymentScreenshot!)}
-                        className="text-[11px] font-extrabold text-[#7c4dff] inline-flex items-center gap-1 cursor-pointer px-2 py-1 rounded-lg bg-white border border-[#e9dffc]"
+                        className="text-[11px] font-bold text-[#7c4dff] inline-flex items-center gap-1 cursor-pointer"
                       >
                         <Eye className="w-3.5 h-3.5" />
-                        <span>View</span>
+                        <span>View Full</span>
                       </button>
                     </div>
-                  ) : (
-                    <div className="mt-1.5 bg-[#f8f5ff] border border-[#e9dffc] rounded-[8px] px-2.5 py-1.5 text-[12px] font-bold text-[#666]">
-                      No Screenshot recorded
-                    </div>
-                  )}
-
-                  <div className="text-[11px] text-[#666] mt-1 tabular-nums">
-                    {order.date} | {order.order_id}
+                    <button
+                      type="button"
+                      onClick={() => setPreviewImg(order.paymentScreenshot!)}
+                      className="w-full block cursor-pointer"
+                    >
+                      <img
+                        src={order.paymentScreenshot}
+                        alt={`Payment screenshot for order #${order.id}`}
+                        className="w-full max-h-44 object-contain rounded-[8px] bg-white border border-[#e9dffc]"
+                      />
+                    </button>
                   </div>
+                )}
 
-                  <div className="mt-2.5 flex items-center gap-2">
-                    <label
-                      htmlFor={`order-status-${order.order_id}`}
-                      className="text-[12px] font-bold text-[#3a1d6d] shrink-0"
+                <div className="text-[11px] text-[#666] mt-1.5 tabular-nums">
+                  {order.createdAt ? formatIndianDateTime(order.createdAt) : order.date} | {order.order_id}
+                </div>
+
+                <div className="mt-2.5 space-y-2">
+                  <input
+                    type="text"
+                    value={notesById[order.order_id] || ''}
+                    onChange={(e) =>
+                      setNotesById((prev) => ({ ...prev, [order.order_id]: e.target.value }))
+                    }
+                    placeholder="Optional message for customer..."
+                    className="w-full px-3 py-2 text-[12px] border border-[#e9dffc] rounded-[10px] outline-none focus:border-[#7c4dff]"
+                  />
+
+                  <div className="grid grid-cols-3 gap-1.5">
+                    <button
+                      type="button"
+                      disabled={isBusy}
+                      onClick={() => handleStatusClick(order.order_id, 'successful')}
+                      className="bg-[#2e7d32] text-white py-2 px-1.5 rounded-[10px] text-[11px] font-extrabold inline-flex items-center justify-center gap-1 cursor-pointer disabled:opacity-60 active:scale-[0.98] whitespace-nowrap"
                     >
-                      Update Status:
-                    </label>
-                    <select
-                      id={`order-status-${order.order_id}`}
-                      value={order.status.toLowerCase()}
-                      onChange={(e) => onOrderStatusChange(order.order_id, e.target.value)}
-                      className="flex-1 px-2.5 py-1.5 text-[12px] font-bold border border-[#e9dffc] rounded-[10px] bg-white text-[#2d1b4e]"
+                      <CheckCircle2 className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                      <span>Successful</span>
+                    </button>
+                    <button
+                      type="button"
+                      disabled={isBusy}
+                      onClick={() => handleStatusClick(order.order_id, 'pending')}
+                      className="bg-[#f59e0b] text-white py-2 px-1.5 rounded-[10px] text-[11px] font-extrabold inline-flex items-center justify-center gap-1 cursor-pointer disabled:opacity-60 active:scale-[0.98] whitespace-nowrap"
                     >
-                      <option value="pending">Pending</option>
-                      <option value="in progress">In Progress</option>
-                      <option value="completed">Completed</option>
-                      <option value="canceled">Canceled</option>
-                    </select>
+                      <Clock className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                      <span>Pending</span>
+                    </button>
+                    <button
+                      type="button"
+                      disabled={isBusy}
+                      onClick={() => handleStatusClick(order.order_id, 'payment_failed')}
+                      className="bg-[#c62828] text-white py-2 px-1.5 rounded-[10px] text-[11px] font-extrabold inline-flex items-center justify-center gap-1 cursor-pointer disabled:opacity-60 active:scale-[0.98] whitespace-nowrap"
+                    >
+                      <XCircle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                      <span>Pay Failed</span>
+                    </button>
                   </div>
                 </div>
-              );
-            })
-          )}
-        </div>
-      )}
+              </div>
+            );
+          })
+        )}
+      </div>
 
       {previewImg && (
         <div

@@ -1,18 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  applyOrderDeduction,
-  createOrderRecord,
-  creditWalletBalance,
-  detectNewPendingPaymentIds,
-  formatBalance,
+  countUnreadNotifications,
+  detectNewOrderIds,
   formatIndianDateTime,
   generateUserId,
   getOrderStatusBadgeStyle,
-  getPaymentStatusBadgeStyle,
   parseHashPage,
-  validateFundAmount,
-  validateOrderPlacement,
+  validateDirectOrderInput,
   validatePaymentScreenshot,
   validatePlatformLink,
 } from './panelLogic';
@@ -34,21 +29,6 @@ test('generateUserId produces TRUST-XXXX in 1000..9999', () => {
   assert.match(generateUserId(), /^TRUST-\d{4}$/);
 });
 
-test('formatBalance formats numeric amounts to two decimal places', () => {
-  assert.equal(formatBalance(0), '0.00');
-  assert.equal(formatBalance(100), '100.00');
-  assert.equal(formatBalance(12.5), '12.50');
-});
-
-test('validateFundAmount enforces minimum ₹1', () => {
-  assert.deepEqual(validateFundAmount(''), { ok: false, message: 'Minimum Add Fund ₹1 hai' });
-  assert.deepEqual(validateFundAmount('0'), { ok: false, message: 'Minimum Add Fund ₹1 hai' });
-  assert.deepEqual(validateFundAmount('0.5'), { ok: false, message: 'Minimum Add Fund ₹1 hai' });
-  assert.deepEqual(validateFundAmount('1'), { ok: true, amount: 1 });
-  assert.deepEqual(validateFundAmount('40'), { ok: true, amount: 40 });
-  assert.deepEqual(validateFundAmount('150.5'), { ok: true, amount: 150.5 });
-});
-
 test('validatePaymentScreenshot requires valid image data URL', () => {
   assert.deepEqual(validatePaymentScreenshot(''), {
     ok: false,
@@ -65,41 +45,67 @@ test('validatePaymentScreenshot requires valid image data URL', () => {
   });
 });
 
-test('detectNewPendingPaymentIds detects only unseen pending requests', () => {
-  const known = new Set(['p1', 'p2']);
+test('detectNewOrderIds detects newly arrived orders for live admin alert', () => {
+  const known = new Set(['ORD1']);
   const incoming = [
     {
-      id: 'p1',
-      uid: 'TRUST-1111',
-      amount: 40,
-      app: 'GPay',
-      hasScreenshot: true,
-      status: 'pending' as const,
+      id: 1,
+      order_id: 'ORD1',
+      service: '1rs = 1k Reels Views',
+      pack: '1K Reels Views',
+      price: 1,
+      amount: 1,
+      link: 'https://instagram.com/reel/a',
+      status: 'pending',
+      date: 'd',
       createdAt: 1,
-      date: 'd',
+      uid: 'TRUST-1111',
     },
     {
-      id: 'p3',
-      uid: 'TRUST-2222',
-      amount: 100,
-      app: 'PhonePe',
-      hasScreenshot: true,
-      status: 'pending' as const,
+      id: 2,
+      order_id: 'ORD2',
+      service: '1rs = 1k Reels Views',
+      pack: '2K Reels Views',
+      price: 2,
+      amount: 2,
+      link: 'https://instagram.com/reel/b',
+      status: 'pending',
+      date: 'd',
       createdAt: 2,
-      date: 'd',
-    },
-    {
-      id: 'p4',
-      uid: 'TRUST-3333',
-      amount: 50,
-      app: 'BHIM',
-      hasScreenshot: true,
-      status: 'approved' as const,
-      createdAt: 3,
-      date: 'd',
+      uid: 'TRUST-2222',
     },
   ];
-  assert.deepEqual(detectNewPendingPaymentIds(known, incoming), ['p3']);
+  assert.deepEqual(detectNewOrderIds(known, incoming), ['ORD2']);
+});
+
+test('countUnreadNotifications counts unread customer alerts accurately', () => {
+  const list = [
+    {
+      id: 'n1',
+      orderId: 'ORD1',
+      orderNum: 1,
+      service: '1rs = 1k Reels Views',
+      pack: '1K Reels Views',
+      status: 'successful',
+      message: 'Order Successful ✅',
+      date: 'd',
+      createdAt: 1,
+      read: false,
+    },
+    {
+      id: 'n2',
+      orderId: 'ORD2',
+      orderNum: 2,
+      service: 'FB FOLLOWERS',
+      pack: '1K Followers',
+      status: 'payment_failed',
+      message: 'Payment Failed ❌',
+      date: 'd',
+      createdAt: 2,
+      read: true,
+    },
+  ];
+  assert.equal(countUnreadNotifications(list), 1);
 });
 
 test('validatePlatformLink rejects wrong domains and invalid service URLs', () => {
@@ -165,14 +171,6 @@ test('validatePlatformLink rejects wrong domains and invalid service URLs', () =
   );
   assert.equal(
     validatePlatformLink({
-      link: 'https://t.me/mychannel',
-      category: 'telegram',
-      serviceId: 'tg-members',
-    }).ok,
-    true,
-  );
-  assert.equal(
-    validatePlatformLink({
       link: 'https://www.youtube.com/@creator',
       category: 'youtube',
       serviceId: 'yt-views',
@@ -187,36 +185,26 @@ test('validatePlatformLink rejects wrong domains and invalid service URLs', () =
     }).ok,
     true,
   );
-  assert.equal(
-    validatePlatformLink({
-      link: 'https://www.youtube.com/@creator',
-      category: 'youtube',
-      serviceId: 'yt-subs',
-    }).ok,
-    true,
-  );
 });
 
-test('validateOrderPlacement checks link, platform validity, selected package, and balance', () => {
+test('validateDirectOrderInput checks link and package without wallet balance gate', () => {
   assert.deepEqual(
-    validateOrderPlacement({
+    validateDirectOrderInput({
       link: '   ',
       linkPrompt: 'Enter Your Reels Link',
       category: 'instagram',
       serviceId: 'ig-reels-1rs',
       selectedPrice: { q: '1K Reels Views', p: 1 },
-      balance: 100,
     }),
     { ok: false, reason: 'missing_link', message: 'Please Enter Your Reels Link' },
   );
 
-  const wrongLink = validateOrderPlacement({
+  const wrongLink = validateDirectOrderInput({
     link: 'https://youtube.com/watch?v=123',
     linkPrompt: 'Enter Your Reels Link',
     category: 'instagram',
     serviceId: 'ig-reels-1rs',
     selectedPrice: { q: '1K Reels Views', p: 1 },
-    balance: 100,
   });
   assert.equal(wrongLink.ok, false);
   if (!wrongLink.ok) {
@@ -224,70 +212,28 @@ test('validateOrderPlacement checks link, platform validity, selected package, a
   }
 
   assert.deepEqual(
-    validateOrderPlacement({
+    validateDirectOrderInput({
       link: 'https://instagram.com/reel/abc123',
       linkPrompt: 'Enter Your Reels Link',
       category: 'instagram',
       serviceId: 'ig-reels-1rs',
       selectedPrice: { q: '10K Reels Views', p: 10 },
-      balance: 5,
-    }),
-    { ok: false, reason: 'low_balance', message: 'Low Balance ❌ Please Add Funds' },
-  );
-
-  assert.deepEqual(
-    validateOrderPlacement({
-      link: 'https://instagram.com/reel/abc123',
-      linkPrompt: 'Enter Your Reels Link',
-      category: 'instagram',
-      serviceId: 'ig-reels-1rs',
-      selectedPrice: { q: '10K Reels Views', p: 10 },
-      balance: 10,
     }),
     { ok: true },
   );
 });
 
-test('wallet credit, order deduction, and order record stay consistent', () => {
-  const afterCredit = creditWalletBalance(0, 100);
-  assert.equal(afterCredit, 100);
-
-  const afterOrder = applyOrderDeduction(afterCredit, 30);
-  assert.equal(afterOrder, 70);
-
-  const order = createOrderRecord({
-    counter: 1,
-    serviceName: 'INDIAN FOLLOWER 🇮🇳',
-    pack: '10K Instagram Followers',
-    price: 30,
-    link: ' https://instagram.com/demo ',
-    uid: 'TRUST-4242',
-    paymentId: 'PAY_1234',
-    timestampMs: 1700000000000,
-    dateStr: '15/11/2023, 03:43:20 am',
-  });
-
-  assert.equal(order.id, 1);
-  assert.equal(order.order_id, 'ORD1700000000000');
-  assert.equal(order.link, 'https://instagram.com/demo');
-  assert.equal(order.paymentId, 'PAY_1234');
-  assert.equal(order.status, 'pending');
-  assert.equal(order.uid, 'TRUST-4242');
+test('getOrderStatusBadgeStyle returns expected labels for pending, successful, payment_failed', () => {
+  assert.equal(getOrderStatusBadgeStyle('pending').label, 'PENDING ⏳');
+  assert.equal(getOrderStatusBadgeStyle('successful').label, 'SUCCESSFUL ✅');
+  assert.equal(getOrderStatusBadgeStyle('payment_failed').label, 'PAYMENT FAILED ❌');
 });
 
-test('status badge helpers return expected styles', () => {
-  assert.equal(getOrderStatusBadgeStyle('pending').label, 'PENDING');
-  assert.equal(getOrderStatusBadgeStyle('completed').label, 'COMPLETED');
-  assert.equal(getPaymentStatusBadgeStyle('pending').label, 'PENDING ⏳');
-  assert.equal(getPaymentStatusBadgeStyle('approved').label, 'FUND ADDED ✅');
-  assert.equal(getPaymentStatusBadgeStyle('wrong_payment').label, 'WRONG PAYMENT ❌');
-});
-
-test('parseHashPage routes valid top-level hashes including #admin', () => {
+test('parseHashPage routes valid top-level hashes and defaults #fund to home', () => {
   assert.equal(parseHashPage('#orders'), 'orders');
-  assert.equal(parseHashPage('#fund'), 'fund');
   assert.equal(parseHashPage('#menu'), 'menu');
   assert.equal(parseHashPage('#admin'), 'admin');
+  assert.equal(parseHashPage('#fund'), 'home');
   assert.equal(parseHashPage('#home'), 'home');
   assert.equal(parseHashPage(''), 'home');
 });

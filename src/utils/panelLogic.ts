@@ -1,12 +1,11 @@
-import {
-  MIN_ADD_FUND,
-  type CategoryKey,
-  type OrderItem,
-  type PaymentFundRequest,
-  type PriceTier,
+import type {
+  CategoryKey,
+  CustomerNotification,
+  OrderItem,
+  PriceTier,
 } from '../data/services';
 
-export type ActivePage = 'home' | 'services' | 'prices' | 'orders' | 'fund' | 'menu' | 'admin';
+export type ActivePage = 'home' | 'services' | 'prices' | 'orders' | 'menu' | 'admin';
 
 export function formatIndianDateTime(timestampMs: number): string {
   return new Intl.DateTimeFormat('en-IN', {
@@ -26,21 +25,6 @@ export function generateUserId(randomFn: () => number = Math.random): string {
   return `TRUST-${num}`;
 }
 
-export function formatBalance(balance: number): string {
-  const safe = Number.isFinite(balance) ? balance : 0;
-  return safe.toFixed(2);
-}
-
-export function validateFundAmount(
-  raw: string,
-): { ok: true; amount: number } | { ok: false; message: string } {
-  const amount = parseFloat(raw);
-  if (!Number.isFinite(amount) || amount < MIN_ADD_FUND) {
-    return { ok: false, message: `Minimum Add Fund ₹${MIN_ADD_FUND} hai` };
-  }
-  return { ok: true, amount: Math.round(amount * 100) / 100 };
-}
-
 export function validatePaymentScreenshot(
   dataUrl: string | null | undefined,
 ): { ok: true; screenshot: string } | { ok: false; message: string } {
@@ -52,13 +36,17 @@ export function validatePaymentScreenshot(
   return { ok: true, screenshot: trimmed };
 }
 
-export function detectNewPendingPaymentIds(
+export function detectNewOrderIds(
   knownIds: Set<string>,
-  incoming: PaymentFundRequest[],
+  incoming: OrderItem[],
 ): string[] {
   return incoming
-    .filter((req) => req.status === 'pending' && !knownIds.has(req.id))
-    .map((req) => req.id);
+    .filter((order) => !knownIds.has(order.order_id))
+    .map((order) => order.order_id);
+}
+
+export function countUnreadNotifications(notifications: CustomerNotification[]): number {
+  return notifications.filter((n) => !n.read).length;
 }
 
 export function validatePlatformLink(params: {
@@ -191,24 +179,25 @@ export function validatePlatformLink(params: {
   return { ok: true };
 }
 
-export interface OrderValidationInput {
+export interface DirectOrderValidationInput {
   link: string;
   linkPrompt: string;
   category: CategoryKey;
   serviceId?: string;
   selectedPrice: PriceTier | null;
-  balance: number;
 }
 
-export type OrderValidationResult =
+export type DirectOrderValidationResult =
   | { ok: true }
   | {
       ok: false;
-      reason: 'missing_link' | 'invalid_link' | 'missing_package' | 'low_balance';
+      reason: 'missing_link' | 'invalid_link' | 'missing_package';
       message: string;
     };
 
-export function validateOrderPlacement(input: OrderValidationInput): OrderValidationResult {
+export function validateDirectOrderInput(
+  input: DirectOrderValidationInput,
+): DirectOrderValidationResult {
   const trimmed = input.link.trim();
   if (!trimmed) {
     return {
@@ -238,52 +227,8 @@ export function validateOrderPlacement(input: OrderValidationInput): OrderValida
       message: 'Select package',
     };
   }
-  if (input.balance < input.selectedPrice.p) {
-    return {
-      ok: false,
-      reason: 'low_balance',
-      message: 'Low Balance ❌ Please Add Funds',
-    };
-  }
+
   return { ok: true };
-}
-
-export function applyOrderDeduction(balance: number, price: number): number {
-  const next = balance - price;
-  return Math.max(0, Math.round(next * 100) / 100);
-}
-
-export function creditWalletBalance(balance: number, amount: number): number {
-  const safeBal = Number.isFinite(balance) ? balance : 0;
-  const safeAmt = Number.isFinite(amount) && amount > 0 ? amount : 0;
-  return Math.round((safeBal + safeAmt) * 100) / 100;
-}
-
-export function createOrderRecord(params: {
-  counter: number;
-  serviceName: string;
-  pack: string;
-  price: number;
-  link: string;
-  uid: string;
-  paymentId?: string;
-  timestampMs?: number;
-  dateStr?: string;
-}): OrderItem {
-  const ts = params.timestampMs ?? Date.now();
-  return {
-    id: params.counter,
-    order_id: `ORD${ts}`,
-    service: params.serviceName,
-    pack: params.pack,
-    price: params.price,
-    amount: params.price,
-    link: params.link.trim(),
-    status: 'pending',
-    date: params.dateStr ?? formatIndianDateTime(ts),
-    uid: params.uid,
-    ...(params.paymentId ? { paymentId: params.paymentId } : {}),
-  };
 }
 
 export function getOrderStatusBadgeStyle(status: string): {
@@ -292,28 +237,16 @@ export function getOrderStatusBadgeStyle(status: string): {
   label: string;
 } {
   const normalized = status.toLowerCase();
-  if (normalized === 'in progress') {
-    return { bg: '#cce5ff', color: '#004085', label: 'IN PROGRESS' };
+  if (normalized === 'successful' || normalized === 'completed') {
+    return { bg: '#d4edda', color: '#155724', label: 'SUCCESSFUL ✅' };
   }
-  if (normalized === 'completed') {
-    return { bg: '#d4edda', color: '#155724', label: 'COMPLETED' };
-  }
-  if (normalized === 'canceled' || normalized === 'cancelled') {
-    return { bg: '#f8d7da', color: '#721c24', label: status.toUpperCase() };
-  }
-  return { bg: '#fff3cd', color: '#856404', label: status.toUpperCase() };
-}
-
-export function getPaymentStatusBadgeStyle(status: string): {
-  bg: string;
-  color: string;
-  label: string;
-} {
-  if (status === 'approved') {
-    return { bg: '#d4edda', color: '#155724', label: 'FUND ADDED ✅' };
-  }
-  if (status === 'wrong_payment') {
-    return { bg: '#f8d7da', color: '#721c24', label: 'WRONG PAYMENT ❌' };
+  if (
+    normalized === 'payment_failed' ||
+    normalized === 'failed' ||
+    normalized === 'canceled' ||
+    normalized === 'cancelled'
+  ) {
+    return { bg: '#f8d7da', color: '#721c24', label: 'PAYMENT FAILED ❌' };
   }
   return { bg: '#fff3cd', color: '#856404', label: 'PENDING ⏳' };
 }
@@ -321,7 +254,6 @@ export function getPaymentStatusBadgeStyle(status: string): {
 export function parseHashPage(hash: string): ActivePage {
   const clean = hash.replace(/^#/, '').toLowerCase();
   if (clean === 'orders') return 'orders';
-  if (clean === 'fund') return 'fund';
   if (clean === 'menu') return 'menu';
   if (clean === 'admin') return 'admin';
   return 'home';

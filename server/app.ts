@@ -12,7 +12,6 @@ const FIREBASE_RTDB_URL =
   process.env.FIREBASE_RTDB_URL ||
   'https://trusted-91b2d-default-rtdb.asia-southeast1.firebasedatabase.app';
 
-// Stable HMAC signing key across serverless cold starts without exposing any secret to clients
 const SESSION_SECRET = process.env.SESSION_SECRET
   ? crypto.createHash('sha256').update(process.env.SESSION_SECRET).digest()
   : crypto
@@ -28,7 +27,7 @@ const STORE_FILE = path.join(DATA_DIR, 'trustedpanel_store.json');
 
 const USER_COOKIE = 'tp_uid_sess';
 const ADMIN_COOKIE = 'tp_admin_sess';
-const MIN_ADD_FUND = 1;
+const USER_SESSION_MAX_AGE_SEC = 60 * 60 * 24 * 365; // 1 year persistent customer memory
 const MAX_SCREENSHOT_BYTES = 1_500_000;
 
 interface ServerPriceTier {
@@ -188,19 +187,6 @@ const SERVER_CATALOG: Record<string, ServerServiceItem[]> = {
   ],
 };
 
-export interface StoredPaymentRequest {
-  id: string;
-  uid: string;
-  amount: number;
-  app: string;
-  screenshot: string;
-  screenshotHash: string;
-  status: 'pending' | 'approved' | 'wrong_payment';
-  adminMessage?: string;
-  createdAt: number;
-  date: string;
-}
-
 export interface StoredOrder {
   id: number;
   order_id: string;
@@ -209,17 +195,35 @@ export interface StoredOrder {
   price: number;
   amount: number;
   link: string;
-  status: string;
+  status: 'pending' | 'successful' | 'payment_failed';
+  adminMessage?: string;
   date: string;
+  createdAt: number;
   uid: string;
-  paymentId?: string;
-  paymentScreenshot?: string;
+  app?: string;
+  paymentScreenshot: string;
+  screenshotHash: string;
+  hiddenFromAdmin?: boolean;
+}
+
+export interface StoredNotification {
+  id: string;
+  uid: string;
+  orderId: string;
+  orderNum: number;
+  service: string;
+  pack: string;
+  status: 'pending' | 'successful' | 'payment_failed';
+  message: string;
+  date: string;
+  createdAt: number;
+  read: boolean;
 }
 
 interface StoreData {
-  wallets: Record<string, number>;
-  paymentRequests: StoredPaymentRequest[];
+  knownUsers: Record<string, number>;
   orders: StoredOrder[];
+  notifications: StoredNotification[];
   orderCounter: number;
 }
 
@@ -364,20 +368,16 @@ function loadStore(): StoreData {
   try {
     if (fs.existsSync(STORE_FILE)) {
       const parsed = JSON.parse(fs.readFileSync(STORE_FILE, 'utf-8'));
-      const rawRequests = Array.isArray(parsed.paymentRequests)
-        ? parsed.paymentRequests
-        : Array.isArray(parsed.utrRequests)
-          ? parsed.utrRequests
-          : [];
       const orders = Array.isArray(parsed.orders) ? parsed.orders : [];
+      const notifications = Array.isArray(parsed.notifications) ? parsed.notifications : [];
       const maxId = orders.reduce(
         (m: number, o: { id?: number }) => (typeof o.id === 'number' && o.id > m ? o.id : m),
         0,
       );
       return {
-        wallets: parsed.wallets && typeof parsed.wallets === 'object' ? parsed.wallets : {},
-        paymentRequests: rawRequests,
+        knownUsers: parsed.knownUsers && typeof parsed.knownUsers === 'object' ? parsed.knownUsers : {},
         orders,
+        notifications,
         orderCounter:
           typeof parsed.orderCounter === 'number' && parsed.orderCounter > maxId
             ? parsed.orderCounter
@@ -387,7 +387,7 @@ function loadStore(): StoreData {
   } catch {
     // Fallback to clean store
   }
-  return { wallets: {}, paymentRequests: [], orders: [], orderCounter: 1 };
+  return { knownUsers: {}, orders: [], notifications: [], orderCounter: 1 };
 }
 
 function saveStore(store: StoreData): void {
@@ -471,7 +471,13 @@ function isHttpsRequest(req: Request): boolean {
   return req.secure || proto === 'https';
 }
 
-function setSessionCookie(res: Response, req: Request, name: string, value: string, maxAgeSec: number): void {
+function setSessionCookie(
+  res: Response,
+  req: Request,
+  name: string,
+  value: string,
+  maxAgeSec: number,
+): void {
   const isHttps = isHttpsRequest(req);
   const parts = [
     `${name}=${encodeURIComponent(value)}`,
@@ -505,7 +511,6 @@ function safeComparePassword(input: string, secret: string): boolean {
   const a = Buffer.from(input, 'utf8');
   const b = Buffer.from(secret, 'utf8');
   if (a.length !== b.length) {
-    // Constant-time dummy comparison to avoid length timing leak
     crypto.timingSafeEqual(Buffer.alloc(32), Buffer.alloc(32));
     return false;
   }
@@ -526,23 +531,41 @@ function resolveQrImagePath(): string | null {
   return null;
 }
 
+function getVerifiedUserSession(req: Request): { uid: string; sid: string; token: string } | null {
+  const cookies = parseCookies(req);
+  const cookieToken = cookies[USER_COOKIE];
+  const headerToken = typeof req.headers['x-user-token'] === 'string' ? req.headers['x-user-token'] : '';
+
+  for (const candidate of [cookieToken, headerToken]) {
+    if (!candidate) continue;
+    const verified = verifyToken<{ uid?: string; sid?: string }>(candidate);
+    if (verified?.uid && verified?.sid && /^TRUST-\d{4}$/.test(verified.uid)) {
+      return { uid: verified.uid, sid: verified.sid, token: candidate };
+    }
+  }
+  return null;
+}
+
 function getOrIssueUserSession(
   req: Request,
   res: Response,
   store: StoreData,
-): { uid: string; sid: string } {
-  const cookies = parseCookies(req);
-  const verified = verifyToken<{ uid?: string; sid?: string }>(cookies[USER_COOKIE]);
-  if (verified?.uid && verified?.sid && /^TRUST-\d{4}$/.test(verified.uid)) {
-    return { uid: verified.uid, sid: verified.sid };
+): { uid: string; sid: string; token: string } {
+  const existing = getVerifiedUserSession(req);
+  if (existing) {
+    // Re-sync cookie if client restored identity from persistent backup header
+    const cookies = parseCookies(req);
+    if (!cookies[USER_COOKIE]) {
+      setSessionCookie(res, req, USER_COOKIE, existing.token, USER_SESSION_MAX_AGE_SEC);
+    }
+    return existing;
   }
 
-  // Generate fresh unique UID on server
   let uid = '';
-  for (let i = 0; i < 12; i++) {
+  for (let i = 0; i < 16; i++) {
     const num = crypto.randomInt(1000, 10000);
     const candidate = `TRUST-${num}`;
-    if (!(candidate in store.wallets)) {
+    if (!(candidate in store.knownUsers)) {
       uid = candidate;
       break;
     }
@@ -551,24 +574,18 @@ function getOrIssueUserSession(
     uid = `TRUST-${crypto.randomInt(1000, 10000)}`;
   }
 
+  store.knownUsers[uid] = Date.now();
+  saveStore(store);
+
   const sid = crypto.randomBytes(16).toString('hex');
   const token = signToken({
     uid,
     sid,
     iat: Date.now(),
-    exp: Date.now() + 1000 * 60 * 60 * 24 * 30,
+    exp: Date.now() + USER_SESSION_MAX_AGE_SEC * 1000,
   });
-  setSessionCookie(res, req, USER_COOKIE, token, 60 * 60 * 24 * 30);
-  return { uid, sid };
-}
-
-function getVerifiedUserSession(req: Request): { uid: string; sid: string } | null {
-  const cookies = parseCookies(req);
-  const verified = verifyToken<{ uid?: string; sid?: string }>(cookies[USER_COOKIE]);
-  if (verified?.uid && verified?.sid && /^TRUST-\d{4}$/.test(verified.uid)) {
-    return { uid: verified.uid, sid: verified.sid };
-  }
-  return null;
+  setSessionCookie(res, req, USER_COOKIE, token, USER_SESSION_MAX_AGE_SEC);
+  return { uid, sid, token };
 }
 
 function isAdminAuthenticated(req: Request): boolean {
@@ -577,7 +594,9 @@ function isAdminAuthenticated(req: Request): boolean {
   return verified?.role === 'admin';
 }
 
-function sanitizeScreenshotDataUrl(raw: unknown): { ok: true; dataUrl: string; hash: string } | { ok: false; message: string } {
+function sanitizeScreenshotDataUrl(
+  raw: unknown,
+): { ok: true; dataUrl: string; hash: string } | { ok: false; message: string } {
   if (typeof raw !== 'string') {
     return { ok: false, message: 'Payment screenshot upload karo ❌' };
   }
@@ -631,25 +650,9 @@ export function createApiApp() {
     }
   }
 
-  // Authenticated user's own state (no :uid enumeration possible)
+  // Customer's own persistent state (orders + live notifications from admin)
   app.get('/api/user-state', (req, res) => {
     const session = getOrIssueUserSession(req, res, store);
-    const balance = typeof store.wallets[session.uid] === 'number' ? store.wallets[session.uid] : 0;
-
-    // Strip raw payment screenshot binary from user polling list so private receipt data is not echoed repeatedly
-    const paymentRequests = store.paymentRequests
-      .filter((r) => r.uid === session.uid)
-      .map((r) => ({
-        id: r.id,
-        uid: r.uid,
-        amount: r.amount,
-        app: r.app,
-        status: r.status,
-        adminMessage: r.adminMessage,
-        createdAt: r.createdAt,
-        date: r.date,
-        hasScreenshot: true,
-      }));
 
     const orders = store.orders
       .filter((o) => o.uid === session.uid)
@@ -662,43 +665,93 @@ export function createApiApp() {
         amount: o.amount,
         link: o.link,
         status: o.status,
+        adminMessage: o.adminMessage,
         date: o.date,
+        createdAt: o.createdAt,
         uid: o.uid,
-        hasPaymentScreenshot: Boolean(o.paymentScreenshot || o.paymentId),
+        app: o.app,
+        hasPaymentScreenshot: Boolean(o.paymentScreenshot),
       }));
+
+    const notifications = store.notifications
+      .filter((n) => n.uid === session.uid)
+      .slice(0, 50);
 
     res.json({
       ok: true,
       uid: session.uid,
-      balance,
-      paymentRequests,
+      sessionToken: session.token,
       orders,
+      notifications,
     });
   });
 
-  // Start a protected checkout session & get single-use QR token
-  app.post('/api/fund/checkout', (req, res) => {
-    pruneTokens();
-    const session = getOrIssueUserSession(req, res, store);
-    const amount = Number(req.body?.amount);
-    if (!Number.isFinite(amount) || amount < MIN_ADD_FUND) {
-      res.status(400).json({ ok: false, message: `Minimum Add Fund ₹${MIN_ADD_FUND} hai` });
+  // Mark all customer notifications as read when Bell modal is opened
+  app.post('/api/notifications/read', (req, res) => {
+    const session = getVerifiedUserSession(req);
+    if (!session) {
+      res.json({ ok: true });
       return;
     }
-    const cleanAmount = Math.round(amount * 100) / 100;
+    let changed = false;
+    for (const n of store.notifications) {
+      if (n.uid === session.uid && !n.read) {
+        n.read = true;
+        changed = true;
+      }
+    }
+    if (changed) saveStore(store);
+    res.json({ ok: true });
+  });
+
+  // Validate service + link & issue single-use QR token for direct order payment
+  app.post('/api/order/checkout', (req, res) => {
+    pruneTokens();
+    const session = getOrIssueUserSession(req, res, store);
+    const category = String(req.body?.category || '').trim();
+    const serviceId = String(req.body?.serviceId || '').trim();
+    const packIndex = Number(req.body?.packIndex);
+    const link = String(req.body?.link || '').trim();
+
+    const catServices = SERVER_CATALOG[category];
+    const service = catServices?.find((s) => s.id === serviceId);
+    if (!service || !Number.isInteger(packIndex) || packIndex < 0 || packIndex >= service.prices.length) {
+      res.status(400).json({ ok: false, message: 'Invalid service or package selected ❌' });
+      return;
+    }
+
+    const linkCheck = validateOrderLinkOnServer({
+      link,
+      category,
+      serviceId: service.id,
+      serviceName: service.name,
+    });
+    if (!linkCheck.ok) {
+      res.status(400).json({ ok: false, reason: 'invalid_link', message: linkCheck.message });
+      return;
+    }
+
+    const packTier = service.prices[packIndex];
     const jti = crypto.randomBytes(12).toString('hex');
     const qrToken = signToken({
       uid: session.uid,
       sid: session.sid,
-      amt: cleanAmount,
+      amt: packTier.p,
       jti,
-      exp: Date.now() + 180_000,
+      exp: Date.now() + 300_000,
     });
-    res.json({ ok: true, amount: cleanAmount, qrToken });
+
+    res.json({
+      ok: true,
+      amount: packTier.p,
+      serviceName: service.name,
+      pack: packTier.q,
+      qrToken,
+    });
   });
 
-  // Serve protected QR image once per checkout token (no static URL, no public access)
-  app.get('/api/fund/qr', (req, res) => {
+  // Serve protected QR image once per checkout token (never exposed publicly)
+  app.get('/api/order/qr', (req, res) => {
     pruneTokens();
     const session = getVerifiedUserSession(req);
     if (!session) {
@@ -724,8 +777,7 @@ export function createApiApp() {
       return;
     }
 
-    // Single-use token: consume immediately so direct link replay fails
-    usedQrTokens.set(decoded.jti, typeof decoded.exp === 'number' ? decoded.exp : Date.now() + 180_000);
+    usedQrTokens.set(decoded.jti, typeof decoded.exp === 'number' ? decoded.exp : Date.now() + 300_000);
 
     res.setHeader('Content-Type', 'image/jpeg');
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
@@ -733,92 +785,14 @@ export function createApiApp() {
     fs.createReadStream(qrPath).pipe(res);
   });
 
-  // Submit a Payment Screenshot request (Min ₹1)
-  app.post('/api/fund/submit-screenshot', async (req, res) => {
-    const session = getVerifiedUserSession(req);
-    if (!session) {
-      res.status(401).json({ ok: false, message: 'Session expired. Page reload karo ❌' });
-      return;
-    }
-
-    const amount = Number(req.body?.amount);
-    const appName = String(req.body?.app || 'UPI').trim().slice(0, 30);
-
-    if (!Number.isFinite(amount) || amount < MIN_ADD_FUND) {
-      res.status(400).json({ ok: false, message: `Minimum Add Fund ₹${MIN_ADD_FUND} hai` });
-      return;
-    }
-
-    const imgCheck = sanitizeScreenshotDataUrl(req.body?.screenshot);
-    if (!imgCheck.ok) {
-      res.status(400).json({ ok: false, message: imgCheck.message });
-      return;
-    }
-
-    // Prevent exact screenshot replay across pending/approved payments
-    const duplicate = store.paymentRequests.find(
-      (r) => r.screenshotHash === imgCheck.hash && r.status !== 'wrong_payment',
-    );
-    if (duplicate) {
-      res.status(400).json({
-        ok: false,
-        message: 'Yeh payment screenshot pehle hi submit ho chuka hai ❌',
-      });
-      return;
-    }
-
-    const now = Date.now();
-    const record: StoredPaymentRequest = {
-      id: `PAY_${now}_${crypto.randomInt(100, 999)}`,
-      uid: session.uid,
-      amount: Math.round(amount * 100) / 100,
-      app: appName,
-      screenshot: imgCheck.dataUrl,
-      screenshotHash: imgCheck.hash,
-      status: 'pending',
-      createdAt: now,
-      date: formatIndianDateTime(now),
-    };
-
-    store.paymentRequests.unshift(record);
-    saveStore(store);
-    void syncToFirebase(`fund_requests/${record.id}`, {
-      id: record.id,
-      uid: record.uid,
-      amount: record.amount,
-      app: record.app,
-      status: record.status,
-      createdAt: record.createdAt,
-      date: record.date,
-    });
-
-    res.json({
-      ok: true,
-      request: {
-        id: record.id,
-        uid: record.uid,
-        amount: record.amount,
-        app: record.app,
-        status: record.status,
-        createdAt: record.createdAt,
-        date: record.date,
-        hasScreenshot: true,
-      },
-    });
-  });
-
-  // Server-authoritative order placement (price, service, uid, balance all enforced on server)
+  // Direct order placement with payment screenshot (no wallet/add-fund step)
   app.post('/api/orders', async (req, res) => {
-    const session = getVerifiedUserSession(req);
-    if (!session) {
-      res.status(401).json({ ok: false, message: 'Session expired. Page reload karo ❌' });
-      return;
-    }
-
+    const session = getOrIssueUserSession(req, res, store);
     const category = String(req.body?.category || '').trim();
     const serviceId = String(req.body?.serviceId || '').trim();
     const packIndex = Number(req.body?.packIndex);
     const link = String(req.body?.link || '').trim();
+    const appName = String(req.body?.app || 'UPI').trim().slice(0, 30);
 
     const catServices = SERVER_CATALOG[category];
     const service = catServices?.find((s) => s.id === serviceId);
@@ -838,30 +812,31 @@ export function createApiApp() {
       return;
     }
 
-    const packTier = service.prices[packIndex];
-    const currentBal = typeof store.wallets[session.uid] === 'number' ? store.wallets[session.uid] : 0;
-    if (currentBal < packTier.p) {
+    const imgCheck = sanitizeScreenshotDataUrl(req.body?.screenshot);
+    if (!imgCheck.ok) {
+      res.status(400).json({ ok: false, reason: 'invalid_screenshot', message: imgCheck.message });
+      return;
+    }
+
+    // Prevent reusing the exact same payment screenshot on multiple non-failed orders
+    const duplicate = store.orders.find(
+      (o) => o.screenshotHash === imgCheck.hash && o.status !== 'payment_failed',
+    );
+    if (duplicate) {
       res.status(400).json({
         ok: false,
-        reason: 'low_balance',
-        message: 'Low Balance ❌ Please Add Funds',
-        balance: currentBal,
+        reason: 'duplicate_screenshot',
+        message: 'Yeh payment screenshot pehle hi use ho chuka hai ❌',
       });
       return;
     }
 
-    const nextBal = Math.max(0, Math.round((currentBal - packTier.p) * 100) / 100);
-    store.wallets[session.uid] = nextBal;
-
-    const latestPayment =
-      store.paymentRequests.find((r) => r.uid === session.uid && r.status === 'approved') ??
-      store.paymentRequests.find((r) => r.uid === session.uid);
-
+    const packTier = service.prices[packIndex];
     const now = Date.now();
     const orderNum = store.orderCounter++;
     const savedOrder: StoredOrder = {
       id: orderNum,
-      order_id: `ORD${now}`,
+      order_id: `ORD${now}_${crypto.randomInt(10, 99)}`,
       service: service.name,
       pack: packTier.q,
       price: packTier.p,
@@ -869,9 +844,12 @@ export function createApiApp() {
       link,
       status: 'pending',
       date: formatIndianDateTime(now),
+      createdAt: now,
       uid: session.uid,
-      paymentId: latestPayment?.id,
-      paymentScreenshot: latestPayment?.screenshot,
+      app: appName,
+      paymentScreenshot: imgCheck.dataUrl,
+      screenshotHash: imgCheck.hash,
+      hiddenFromAdmin: false,
     };
 
     store.orders.unshift(savedOrder);
@@ -885,10 +863,9 @@ export function createApiApp() {
       link: savedOrder.link,
       status: savedOrder.status,
       date: savedOrder.date,
+      createdAt: savedOrder.createdAt,
       uid: savedOrder.uid,
-      paymentId: savedOrder.paymentId,
     });
-    void syncToFirebase(`wallets/${session.uid}`, { balance: nextBal });
 
     res.json({
       ok: true,
@@ -902,19 +879,20 @@ export function createApiApp() {
         link: savedOrder.link,
         status: savedOrder.status,
         date: savedOrder.date,
+        createdAt: savedOrder.createdAt,
         uid: savedOrder.uid,
-        hasPaymentScreenshot: Boolean(savedOrder.paymentScreenshot || savedOrder.paymentId),
+        app: savedOrder.app,
+        hasPaymentScreenshot: true,
       },
-      balance: nextBal,
     });
   });
 
-  // Admin session check (no secret stored in browser localStorage)
+  // Admin session check
   app.get('/api/admin/session', (req, res) => {
     res.json({ ok: true, authenticated: isAdminAuthenticated(req) });
   });
 
-  // Admin login (timing-safe comparison + HttpOnly HMAC cookie + rate limiting)
+  // Admin login (timing-safe + HttpOnly cookie + brute-force limit)
   app.post('/api/admin/login', (req, res) => {
     pruneTokens();
     const ip = String(req.headers['x-forwarded-for'] || req.ip || 'unknown').split(',')[0].trim();
@@ -947,84 +925,36 @@ export function createApiApp() {
     res.json({ ok: true });
   });
 
+  // Live Admin orders list — orders stay permanently until Admin explicitly deletes them
   app.get('/api/admin/overview', (req, res) => {
     if (!isAdminAuthenticated(req)) {
       res.status(401).json({ ok: false, message: 'Unauthorized' });
       return;
     }
+    const visibleOrders = store.orders.filter((o) => !o.hiddenFromAdmin);
     res.json({
       ok: true,
-      paymentRequests: store.paymentRequests,
-      orders: store.orders,
+      orders: visibleOrders,
     });
   });
 
-  app.post('/api/admin/payment-action', async (req, res) => {
-    if (!isAdminAuthenticated(req)) {
-      res.status(401).json({ ok: false, message: 'Unauthorized' });
-      return;
-    }
-
-    const id = String(req.body?.id || '');
-    const action = String(req.body?.action || '');
-    const note = String(req.body?.note || '').trim().slice(0, 200);
-
-    const target = store.paymentRequests.find((r) => r.id === id);
-    if (!target) {
-      res.status(404).json({ ok: false, message: 'Payment request not found' });
-      return;
-    }
-    if (target.status !== 'pending') {
-      res.status(400).json({ ok: false, message: 'Already processed' });
-      return;
-    }
-
-    if (action === 'approve') {
-      target.status = 'approved';
-      target.adminMessage = note || `₹${target.amount.toFixed(2)} Fund Added ✅`;
-      const prevBal = typeof store.wallets[target.uid] === 'number' ? store.wallets[target.uid] : 0;
-      const nextBal = Math.round((prevBal + target.amount) * 100) / 100;
-      store.wallets[target.uid] = nextBal;
-      saveStore(store);
-      void syncToFirebase(`fund_requests/${target.id}`, {
-        id: target.id,
-        uid: target.uid,
-        amount: target.amount,
-        status: target.status,
-        adminMessage: target.adminMessage,
-      });
-      void syncToFirebase(`wallets/${target.uid}`, { balance: nextBal });
-      res.json({ ok: true, request: target, walletBalance: nextBal });
-      return;
-    }
-
-    if (action === 'wrong_payment') {
-      target.status = 'wrong_payment';
-      target.adminMessage = note || 'Wrong Payment / Invalid Screenshot ❌';
-      saveStore(store);
-      void syncToFirebase(`fund_requests/${target.id}`, {
-        id: target.id,
-        uid: target.uid,
-        amount: target.amount,
-        status: target.status,
-        adminMessage: target.adminMessage,
-      });
-      res.json({ ok: true, request: target });
-      return;
-    }
-
-    res.status(400).json({ ok: false, message: 'Invalid action' });
-  });
-
+  // Admin updates order status (Successful / Pending / Payment Failed) & pushes customer bell notification
   app.post('/api/admin/order-status', async (req, res) => {
     if (!isAdminAuthenticated(req)) {
       res.status(401).json({ ok: false, message: 'Unauthorized' });
       return;
     }
 
-    const orderId = String(req.body?.order_id || '');
-    const status = String(req.body?.status || '').trim();
-    if (!['pending', 'in progress', 'completed', 'canceled'].includes(status.toLowerCase())) {
+    const orderId = String(req.body?.order_id || '').trim();
+    const rawStatus = String(req.body?.status || '').trim().toLowerCase();
+    const note = String(req.body?.note || '').trim().slice(0, 200);
+
+    let normalizedStatus: 'pending' | 'successful' | 'payment_failed' | null = null;
+    if (rawStatus === 'successful' || rawStatus === 'completed') normalizedStatus = 'successful';
+    else if (rawStatus === 'payment_failed' || rawStatus === 'failed') normalizedStatus = 'payment_failed';
+    else if (rawStatus === 'pending') normalizedStatus = 'pending';
+
+    if (!normalizedStatus) {
       res.status(400).json({ ok: false, message: 'Invalid status' });
       return;
     }
@@ -1035,13 +965,61 @@ export function createApiApp() {
       return;
     }
 
-    target.status = status;
+    const defaultMsg =
+      normalizedStatus === 'successful'
+        ? `Order #${target.id} Successful ✅`
+        : normalizedStatus === 'payment_failed'
+          ? `Order #${target.id} Payment Failed ❌`
+          : `Order #${target.id} is Pending ⏳`;
+
+    target.status = normalizedStatus;
+    target.adminMessage = note || defaultMsg;
+
+    const now = Date.now();
+    const notif: StoredNotification = {
+      id: `NOTIF_${now}_${crypto.randomInt(100, 999)}`,
+      uid: target.uid,
+      orderId: target.order_id,
+      orderNum: target.id,
+      service: target.service,
+      pack: target.pack,
+      status: normalizedStatus,
+      message: note || defaultMsg,
+      date: formatIndianDateTime(now),
+      createdAt: now,
+      read: false,
+    };
+
+    store.notifications.unshift(notif);
     saveStore(store);
+
     void syncToFirebase(`orders/${target.order_id}`, {
       order_id: target.order_id,
       status: target.status,
+      adminMessage: target.adminMessage,
     });
-    res.json({ ok: true, order: target });
+    void syncToFirebase(`notifications/${target.uid}/${notif.id}`, notif);
+
+    res.json({ ok: true, order: target, notification: notif });
+  });
+
+  // Admin explicitly deletes an order notification from Admin Panel
+  app.delete('/api/admin/orders/:orderId', (req, res) => {
+    if (!isAdminAuthenticated(req)) {
+      res.status(401).json({ ok: false, message: 'Unauthorized' });
+      return;
+    }
+
+    const orderId = String(req.params.orderId || '').trim();
+    const target = store.orders.find((o) => o.order_id === orderId);
+    if (!target) {
+      res.status(404).json({ ok: false, message: 'Order not found' });
+      return;
+    }
+
+    target.hiddenFromAdmin = true;
+    saveStore(store);
+    res.json({ ok: true, order_id: orderId });
   });
 
   return app;

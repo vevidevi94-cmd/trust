@@ -1,15 +1,12 @@
 import React from 'react';
-import type { OrderItem, PaymentFundRequest } from '../data/services';
-import { getOrderStatusBadgeStyle, getPaymentStatusBadgeStyle } from '../utils/panelLogic';
+import type { OrderItem } from '../data/services';
+import { formatIndianDateTime, getOrderStatusBadgeStyle } from '../utils/panelLogic';
 
 interface OrdersViewProps {
   orders: OrderItem[];
-  paymentRequests: PaymentFundRequest[];
 }
 
-export function OrdersView({ orders, paymentRequests }: OrdersViewProps) {
-  const latestPayment = paymentRequests[0] ?? null;
-
+export function OrdersView({ orders }: OrdersViewProps) {
   return (
     <section aria-labelledby="my-orders-heading">
       <h1
@@ -18,36 +15,6 @@ export function OrdersView({ orders, paymentRequests }: OrdersViewProps) {
       >
         My Orders
       </h1>
-
-      {latestPayment && (
-        <div className="bg-white rounded-[16px] p-[12px] mb-3 shadow-[0_4px_12px_rgba(60,20,120,0.06)] border border-[#e9dffc]">
-          <div className="flex justify-between items-center gap-2">
-            <span className="text-[12px] font-bold text-[#3a1d6d]">
-              Latest Payment • ₹{latestPayment.amount.toFixed(2)} ({latestPayment.app})
-            </span>
-            {(() => {
-              const badge = getPaymentStatusBadgeStyle(latestPayment.status);
-              return (
-                <span
-                  style={{ backgroundColor: badge.bg, color: badge.color }}
-                  className="px-[8px] py-[3px] rounded-[10px] text-[10px] font-extrabold whitespace-nowrap shrink-0"
-                >
-                  {badge.label}
-                </span>
-              );
-            })()}
-          </div>
-          {latestPayment.adminMessage && (
-            <div
-              className={`text-[12px] font-semibold mt-1 ${
-                latestPayment.status === 'wrong_payment' ? 'text-[#c62828]' : 'text-[#2e7d32]'
-              }`}
-            >
-              {latestPayment.adminMessage}
-            </div>
-          )}
-        </div>
-      )}
 
       {orders.length === 0 ? (
         <div className="text-center text-[#555555] mt-[30px] text-[15px]">
@@ -79,13 +46,21 @@ export function OrdersView({ orders, paymentRequests }: OrdersViewProps) {
                 <div className="text-[12px] text-[#7c4dff] break-all mt-0.5">
                   {order.link}
                 </div>
-                {(order.hasPaymentScreenshot || order.paymentId) && (
-                  <div className="text-[11px] font-bold text-[#2e7d32] mt-0.5">
-                    Payment Screenshot Verified ✅
+                {order.adminMessage && (
+                  <div
+                    className={`text-[12px] font-bold mt-1 ${
+                      order.status.toLowerCase() === 'payment_failed'
+                        ? 'text-[#c62828]'
+                        : order.status.toLowerCase() === 'successful'
+                          ? 'text-[#2e7d32]'
+                          : 'text-[#856404]'
+                    }`}
+                  >
+                    {order.adminMessage}
                   </div>
                 )}
                 <div className="text-[11px] text-[#666666] mt-0.5 tabular-nums">
-                  {order.date} | {order.order_id}
+                  {order.createdAt ? formatIndianDateTime(order.createdAt) : order.date} | {order.order_id}
                 </div>
               </div>
             );

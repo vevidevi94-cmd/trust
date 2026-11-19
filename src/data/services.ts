@@ -30,7 +30,7 @@ export interface CategoryMeta {
   icon: IconKind;
 }
 
-export type OrderStatus = 'pending' | 'in progress' | 'completed' | 'canceled';
+export type OrderStatus = 'pending' | 'successful' | 'payment_failed';
 
 export interface OrderItem {
   id: number;
@@ -41,26 +41,26 @@ export interface OrderItem {
   amount: number;
   link: string;
   status: OrderStatus | string;
+  adminMessage?: string;
   date: string;
+  createdAt: number;
   uid: string;
-  paymentId?: string;
+  app?: string;
   paymentScreenshot?: string;
   hasPaymentScreenshot?: boolean;
 }
 
-export type PaymentRequestStatus = 'pending' | 'approved' | 'wrong_payment';
-
-export interface PaymentFundRequest {
+export interface CustomerNotification {
   id: string;
-  uid: string;
-  amount: number;
-  app: string;
-  screenshot?: string;
-  hasScreenshot?: boolean;
-  status: PaymentRequestStatus;
-  adminMessage?: string;
-  createdAt: number;
+  orderId: string;
+  orderNum: number;
+  service: string;
+  pack: string;
+  status: OrderStatus | string;
+  message: string;
   date: string;
+  createdAt: number;
+  read: boolean;
 }
 
 export interface SupportMessage {
@@ -283,4 +283,3 @@ export const SERVICE_CATALOG: Record<CategoryKey, ServiceItem[]> = {
 export const TELEGRAM_SUPPORT_URL = 'https://t.me/Iamkillerb';
 export const TELEGRAM_HANDLE = '@Iamkillerb';
 export const POSTER_IMAGE_PATH = '/assets/aistudio/poster_518c6229.jpg';
-export const MIN_ADD_FUND = 1;

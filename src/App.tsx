@@ -3,17 +3,17 @@ import {
   CATEGORIES,
   SERVICE_CATALOG,
   type CategoryKey,
+  type CustomerNotification,
   type OrderItem,
-  type PaymentFundRequest,
   type PriceTier,
   type ServiceItem,
   type SupportMessage,
 } from './data/services';
 import {
-  applyOrderDeduction,
-  detectNewPendingPaymentIds,
+  countUnreadNotifications,
+  detectNewOrderIds,
   parseHashPage,
-  validateOrderPlacement,
+  validateDirectOrderInput,
   type ActivePage,
 } from './utils/panelLogic';
 import {
@@ -26,20 +26,50 @@ import { Header } from './components/Header';
 import { BottomNav } from './components/BottomNav';
 import { HomeView } from './components/HomeView';
 import { ServicesView } from './components/ServicesView';
-import { PricesView } from './components/PricesView';
+import { PricesView, type DirectCheckoutState } from './components/PricesView';
 import { OrdersView } from './components/OrdersView';
-import { FundView, type CheckoutSessionState } from './components/FundView';
 import { MenuView } from './components/MenuView';
 import { AdminView } from './components/AdminView';
 import { SupportModal } from './components/SupportModal';
+import { NotificationsModal } from './components/NotificationsModal';
 
-type ModalKind = 'support' | 'checkout' | 'admin-login' | null;
+type ModalKind = 'support' | 'notifications' | 'checkout' | 'admin-login' | null;
 
 interface NavHistoryState {
   page: ActivePage;
   cat: CategoryKey;
   serviceId: string | null;
   modal: ModalKind;
+}
+
+const STORAGE_USER_TOKEN_KEY = 'tp_user_session_v2';
+const STORAGE_ORDERS_CACHE_KEY = 'tp_orders_cache_v2';
+const STORAGE_NOTIFS_CACHE_KEY = 'tp_notifs_cache_v2';
+
+function readSavedUserToken(): string {
+  try {
+    return localStorage.getItem(STORAGE_USER_TOKEN_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
+function readCachedOrders(): OrderItem[] {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(STORAGE_ORDERS_CACHE_KEY) || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function readCachedNotifications(): CustomerNotification[] {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(STORAGE_NOTIFS_CACHE_KEY) || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
 }
 
 function getInitialSupportMessages(): SupportMessage[] {
@@ -58,15 +88,14 @@ function findServiceById(cat: CategoryKey, serviceId: string | null): ServiceIte
 
 export default function App() {
   const [uid, setUid] = useState<string>('TRUST-...');
-  const [balance, setBalance] = useState<number>(0);
-  const [orders, setOrders] = useState<OrderItem[]>([]);
-  const [paymentRequests, setPaymentRequests] = useState<PaymentFundRequest[]>([]);
+  const [userToken, setUserToken] = useState<string>(readSavedUserToken);
+  const [orders, setOrders] = useState<OrderItem[]>(readCachedOrders);
+  const [notifications, setNotifications] = useState<CustomerNotification[]>(readCachedNotifications);
   const [supportMessages, setSupportMessages] = useState<SupportMessage[]>(
     getInitialSupportMessages,
   );
 
   const [isAdminLoggedIn, setIsAdminLoggedIn] = useState<boolean>(false);
-  const [adminPaymentRequests, setAdminPaymentRequests] = useState<PaymentFundRequest[]>([]);
   const [adminOrders, setAdminOrders] = useState<OrderItem[]>([]);
 
   const [activePage, setActivePage] = useState<ActivePage>(() => {
@@ -77,7 +106,9 @@ export default function App() {
   const [currentService, setCurrentService] = useState<ServiceItem | null>(null);
 
   const [supportOpen, setSupportOpen] = useState(false);
-  const [checkoutSession, setCheckoutSession] = useState<CheckoutSessionState | null>(null);
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
+  const [checkoutState, setCheckoutState] = useState<DirectCheckoutState | null>(null);
+  const [processingOrder, setProcessingOrder] = useState<OrderItem | null>(null);
   const [adminLoginOpen, setAdminLoginOpen] = useState(false);
 
   const [toastState, setToastState] = useState<{
@@ -91,8 +122,8 @@ export default function App() {
   });
 
   const toastTimerRef = useRef<number | null>(null);
-  const prevPaymentStatusRef = useRef<Map<string, string>>(new Map());
-  const knownAdminPendingIdsRef = useRef<Set<string> | null>(null);
+  const knownAdminOrderIdsRef = useRef<Set<string> | null>(null);
+  const knownCustomerNotifIdsRef = useRef<Set<string> | null>(null);
   const historyDepthRef = useRef<number>(0);
 
   const showToast = useCallback((message: string, isError = false) => {
@@ -105,16 +136,18 @@ export default function App() {
     }, 4000);
   }, []);
 
-  // Only persist non-sensitive support chat history locally
+  // Persist customer's own orders, notifications, and support messages locally so reopening browser remembers them
   useEffect(() => {
     try {
       localStorage.setItem('tp_support_msgs', JSON.stringify(supportMessages));
+      localStorage.setItem(STORAGE_ORDERS_CACHE_KEY, JSON.stringify(orders));
+      localStorage.setItem(STORAGE_NOTIFS_CACHE_KEY, JSON.stringify(notifications));
     } catch {
       // Ignore storage quota errors
     }
-  }, [supportMessages]);
+  }, [supportMessages, orders, notifications]);
 
-  // Verify admin HttpOnly cookie session on mount (no secret stored in browser storage)
+  // Verify admin HttpOnly cookie session on mount
   useEffect(() => {
     fetch('/api/admin/session', { credentials: 'same-origin' })
       .then((res) => (res.ok ? res.json() : null))
@@ -159,16 +192,18 @@ export default function App() {
         setCurrentService(findServiceById(st.cat || 'instagram', st.serviceId));
         setActivePage(targetPage);
         setSupportOpen(st.modal === 'support');
+        setNotificationsOpen(st.modal === 'notifications');
         setAdminLoginOpen(st.modal === 'admin-login');
         if (st.modal !== 'checkout') {
-          setCheckoutSession(null);
+          setCheckoutState(null);
         }
         return;
       }
 
       setSupportOpen(false);
+      setNotificationsOpen(false);
       setAdminLoginOpen(false);
-      setCheckoutSession(null);
+      setCheckoutState(null);
       const hashPage = parseHashPage(window.location.hash);
       setActivePage(hashPage === 'admin' && !isAdminLoggedIn ? 'menu' : hashPage);
     };
@@ -183,9 +218,10 @@ export default function App() {
       setCurrentCategory(next.cat);
       setCurrentService(findServiceById(next.cat, next.serviceId));
       setSupportOpen(next.modal === 'support');
+      setNotificationsOpen(next.modal === 'notifications');
       setAdminLoginOpen(next.modal === 'admin-login');
       if (next.modal !== 'checkout') {
-        setCheckoutSession(null);
+        setCheckoutState(null);
       }
 
       const hash = hashOverride ?? next.page;
@@ -219,60 +255,112 @@ export default function App() {
     [currentCategory, pushNavState],
   );
 
-  // Sync user's live authoritative balance, payment statuses, and orders via HttpOnly session cookie
-  const syncUserState = useCallback(async () => {
-    try {
-      const res = await fetch('/api/user-state', {
-        credentials: 'same-origin',
-        cache: 'no-store',
-      });
-      if (!res.ok) return;
-      const data = (await res.json()) as {
-        ok?: boolean;
-        uid?: string;
-        balance?: number;
-        paymentRequests?: PaymentFundRequest[];
-        orders?: OrderItem[];
-      };
-      if (!data.ok) return;
-
-      if (data.uid) {
-        setUid(data.uid);
+  // Helper to attach persistent HMAC user token header in case cookies are blocked in WebViews
+  const getUserHeaders = useCallback(
+    (extra?: Record<string, string>): Record<string, string> => {
+      const headers: Record<string, string> = { ...(extra ?? {}) };
+      if (userToken) {
+        headers['x-user-token'] = userToken;
       }
-      if (typeof data.balance === 'number') {
-        setBalance(data.balance);
-      }
+      return headers;
+    },
+    [userToken],
+  );
 
-      if (Array.isArray(data.paymentRequests)) {
-        for (const req of data.paymentRequests) {
-          const prev = prevPaymentStatusRef.current.get(req.id);
-          if (prev === 'pending' && req.status === 'approved') {
-            showToast(`₹${req.amount.toFixed(2)} Fund Added to Wallet ✅`);
-          } else if (prev === 'pending' && req.status === 'wrong_payment') {
-            showToast(req.adminMessage || 'Wrong Payment / Invalid Screenshot ❌', true);
-          }
-          prevPaymentStatusRef.current.set(req.id, req.status);
+  // Sync customer's live orders and Bell notifications from server
+  const syncUserState = useCallback(
+    async (isInitialPoll = false) => {
+      try {
+        const res = await fetch('/api/user-state', {
+          credentials: 'same-origin',
+          cache: 'no-store',
+          headers: getUserHeaders(),
+        });
+        if (!res.ok) return;
+        const data = (await res.json()) as {
+          ok?: boolean;
+          uid?: string;
+          sessionToken?: string;
+          orders?: OrderItem[];
+          notifications?: CustomerNotification[];
+        };
+        if (!data.ok) return;
+
+        if (data.uid) {
+          setUid(data.uid);
         }
-        setPaymentRequests(data.paymentRequests);
-      }
+        if (data.sessionToken && data.sessionToken !== userToken) {
+          setUserToken(data.sessionToken);
+          try {
+            localStorage.setItem(STORAGE_USER_TOKEN_KEY, data.sessionToken);
+          } catch {
+            // Ignore storage errors
+          }
+        }
 
-      if (Array.isArray(data.orders)) {
-        setOrders(data.orders);
+        if (Array.isArray(data.orders)) {
+          // Merge server orders with local cache so orders persist even across serverless cold restarts
+          setOrders((prev) => {
+            if (data.orders!.length === 0 && prev.length > 0) {
+              return prev;
+            }
+            const byId = new Map<string, OrderItem>();
+            for (const o of data.orders!) {
+              byId.set(o.order_id, o);
+            }
+            for (const cached of prev) {
+              if (!byId.has(cached.order_id) && (!data.uid || cached.uid === data.uid)) {
+                byId.set(cached.order_id, cached);
+              }
+            }
+            return Array.from(byId.values()).sort(
+              (a, b) => (b.createdAt || 0) - (a.createdAt || 0) || b.id - a.id,
+            );
+          });
+        }
+
+        if (Array.isArray(data.notifications)) {
+          if (knownCustomerNotifIdsRef.current === null || isInitialPoll) {
+            knownCustomerNotifIdsRef.current = new Set(data.notifications.map((n) => n.id));
+          } else {
+            const fresh = data.notifications.filter(
+              (n) => !n.read && !knownCustomerNotifIdsRef.current!.has(n.id),
+            );
+            if (fresh.length > 0) {
+              for (const n of fresh) {
+                knownCustomerNotifIdsRef.current.add(n.id);
+              }
+              const latest = fresh[0];
+              showToast(
+                `🔔 ${latest.message}`,
+                latest.status.toLowerCase() === 'payment_failed',
+              );
+            }
+          }
+
+          setNotifications((prev) => {
+            if (data.notifications!.length === 0 && prev.length > 0) {
+              return prev;
+            }
+            return data.notifications!;
+          });
+        }
+      } catch {
+        // Ignore transient network errors during poll
       }
-    } catch {
-      // Ignore transient network errors during poll
-    }
-  }, [showToast]);
+    },
+    [getUserHeaders, showToast, userToken],
+  );
 
   useEffect(() => {
-    void syncUserState();
+    void syncUserState(true);
     const timer = window.setInterval(() => {
-      void syncUserState();
+      void syncUserState(false);
     }, 2500);
     return () => window.clearInterval(timer);
   }, [syncUserState]);
 
-  // Sync Admin overview + trigger 3-second iPhone notification when a new Payment Screenshot arrives
+  // Sync Admin live orders + trigger 3-second iPhone notification immediately when a new order arrives
   const syncAdminOverview = useCallback(
     async (isInitialPoll = false) => {
       if (!isAdminLoggedIn) return;
@@ -288,35 +376,30 @@ export default function App() {
         if (!res.ok) return;
         const data = (await res.json()) as {
           ok?: boolean;
-          paymentRequests?: PaymentFundRequest[];
           orders?: OrderItem[];
         };
         if (!data.ok) return;
 
-        const incomingPayments = Array.isArray(data.paymentRequests) ? data.paymentRequests : [];
         const incomingOrders = Array.isArray(data.orders) ? data.orders : [];
 
-        if (knownAdminPendingIdsRef.current === null || isInitialPoll) {
-          knownAdminPendingIdsRef.current = new Set(
-            incomingPayments.filter((r) => r.status === 'pending').map((r) => r.id),
-          );
+        if (knownAdminOrderIdsRef.current === null || isInitialPoll) {
+          knownAdminOrderIdsRef.current = new Set(incomingOrders.map((o) => o.order_id));
         } else {
-          const newIds = detectNewPendingPaymentIds(knownAdminPendingIdsRef.current, incomingPayments);
+          const newIds = detectNewOrderIds(knownAdminOrderIdsRef.current, incomingOrders);
           if (newIds.length > 0) {
             for (const id of newIds) {
-              knownAdminPendingIdsRef.current.add(id);
+              knownAdminOrderIdsRef.current.add(id);
             }
-            const newest = incomingPayments.find((r) => r.id === newIds[0]);
+            const newest = incomingOrders.find((o) => o.order_id === newIds[0]);
             playIphoneNotification3Sec();
             showToast(
               newest
-                ? `🔔 New Payment Screenshot ₹${newest.amount.toFixed(0)} from ${newest.uid}`
-                : '🔔 New Payment Screenshot Received!',
+                ? `🔔 New Order #${newest.id} (₹${newest.price}) • ${newest.service}`
+                : '🔔 New Live Order Received!',
             );
           }
         }
 
-        setAdminPaymentRequests(incomingPayments);
         setAdminOrders(incomingOrders);
       } catch {
         // Ignore transient poll errors
@@ -327,7 +410,7 @@ export default function App() {
 
   useEffect(() => {
     if (!isAdminLoggedIn) {
-      knownAdminPendingIdsRef.current = null;
+      knownAdminOrderIdsRef.current = null;
       return;
     }
     void syncAdminOverview(true);
@@ -395,16 +478,6 @@ export default function App() {
     });
   }, [currentCategory, pushNavState]);
 
-  const handleGoFund = useCallback(() => {
-    playClickSound();
-    pushNavState({
-      page: 'fund',
-      cat: currentCategory,
-      serviceId: null,
-      modal: null,
-    });
-  }, [currentCategory, pushNavState]);
-
   const handleGoMenu = useCallback(() => {
     playClickSound();
     pushNavState({
@@ -436,50 +509,185 @@ export default function App() {
     }
   }, []);
 
-  const handleOpenCheckout = useCallback(
-    async (amount: number) => {
+  const handleOpenNotifications = useCallback(() => {
+    playClickSound();
+    pushNavState(
+      {
+        page: activePage,
+        cat: currentCategory,
+        serviceId: currentService?.id ?? null,
+        modal: 'notifications',
+      },
+      activePage,
+    );
+
+    // Mark notifications as read so red badge clears immediately
+    setNotifications((prev) => prev.map((n) => ({ ...n, read: true })));
+    fetch('/api/notifications/read', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: getUserHeaders(),
+    }).catch(() => {});
+  }, [activePage, currentCategory, currentService?.id, getUserHeaders, pushNavState]);
+
+  const handleCloseNotifications = useCallback(() => {
+    if (historyDepthRef.current > 0) {
+      window.history.back();
+    } else {
+      setNotificationsOpen(false);
+    }
+  }, []);
+
+  // Direct Order Step 1: Validate link -> Request single-use QR scanner modal
+  const handleRequestDirectCheckout = useCallback(
+    async ({
+      link,
+      selectedPrice,
+      packIndex,
+    }: {
+      link: string;
+      selectedPrice: PriceTier | null;
+      packIndex: number | null;
+    }): Promise<boolean> => {
+      playClickSound();
+      if (!currentService) return false;
+
+      const validation = validateDirectOrderInput({
+        link,
+        linkPrompt: currentService.link,
+        category: currentCategory,
+        serviceId: currentService.id,
+        selectedPrice,
+      });
+
+      if (!validation.ok) {
+        showToast(validation.message, true);
+        return false;
+      }
+
+      if (!selectedPrice || packIndex === null) return false;
+
       try {
-        const res = await fetch('/api/fund/checkout', {
+        const res = await fetch('/api/order/checkout', {
           method: 'POST',
           credentials: 'same-origin',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ amount }),
+          headers: getUserHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify({
+            category: currentCategory,
+            serviceId: currentService.id,
+            packIndex,
+            link: link.trim(),
+          }),
         });
         const data = (await res.json()) as {
           ok?: boolean;
           amount?: number;
+          serviceName?: string;
+          pack?: string;
           qrToken?: string;
           message?: string;
         };
+
         if (!res.ok || !data.ok || !data.qrToken || typeof data.amount !== 'number') {
-          showToast(data.message || 'Unable to open scanner ❌', true);
-          return;
+          showToast(data.message || 'Unable to open QR scanner ❌', true);
+          return false;
         }
 
-        showToast(`Scanner Ready ₹${data.amount} • Pay & Upload Screenshot`);
-        setCheckoutSession({ amount: data.amount, qrToken: data.qrToken });
+        setCheckoutState({
+          amount: data.amount,
+          serviceName: data.serviceName || currentService.name,
+          pack: data.pack || selectedPrice.q,
+          packIndex,
+          link: link.trim(),
+          qrToken: data.qrToken,
+        });
         pushNavState(
           {
-            page: 'fund',
+            page: 'prices',
             cat: currentCategory,
-            serviceId: null,
+            serviceId: currentService.id,
             modal: 'checkout',
           },
-          'fund',
+          'prices',
         );
+        return true;
       } catch {
         showToast('Network Error ❌ Try Again', true);
+        return false;
       }
     },
-    [currentCategory, pushNavState, showToast],
+    [currentCategory, currentService, getUserHeaders, pushNavState, showToast],
   );
 
   const handleCloseCheckout = useCallback(() => {
-    setCheckoutSession(null);
+    setCheckoutState(null);
     if (historyDepthRef.current > 0) {
       window.history.back();
     }
   }, []);
+
+  // Direct Order Step 2: Submit payment screenshot & place order -> show Order Processing modal
+  const handleConfirmDirectOrder = useCallback(
+    async ({
+      packIndex,
+      link,
+      screenshot,
+    }: {
+      packIndex: number;
+      link: string;
+      screenshot: string;
+    }): Promise<boolean> => {
+      if (!currentService) return false;
+      try {
+        const res = await fetch('/api/orders', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: getUserHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify({
+            category: currentCategory,
+            serviceId: currentService.id,
+            packIndex,
+            link,
+            screenshot,
+          }),
+        });
+        const data = (await res.json()) as {
+          ok?: boolean;
+          order?: OrderItem;
+          message?: string;
+        };
+
+        if (!res.ok || !data.ok || !data.order) {
+          showToast(data.message || 'Order Failed ❌ Try Again', true);
+          return false;
+        }
+
+        setOrders((prev) => [data.order!, ...prev]);
+        setCheckoutState(null);
+        setProcessingOrder(data.order);
+        return true;
+      } catch {
+        showToast('Network Error ❌ Try Again', true);
+        return false;
+      }
+    },
+    [currentCategory, currentService, getUserHeaders, showToast],
+  );
+
+  // Direct Order Step 3: Click OK on "Order Processing" -> return straight to Home
+  const handleAcknowledgeProcessing = useCallback(() => {
+    playClickSound();
+    setProcessingOrder(null);
+    pushNavState(
+      {
+        page: 'home',
+        cat: currentCategory,
+        serviceId: null,
+        modal: null,
+      },
+      'home',
+    );
+  }, [currentCategory, pushNavState]);
 
   const handleOpenAdminLogin = useCallback(() => {
     playClickSound();
@@ -558,10 +766,9 @@ export default function App() {
         credentials: 'same-origin',
       });
     } catch {
-      // Ignore logout network error
+      // Ignore logout error
     }
     setIsAdminLoggedIn(false);
-    setAdminPaymentRequests([]);
     setAdminOrders([]);
     showToast('Admin Logged Out');
     pushNavState({
@@ -572,73 +779,37 @@ export default function App() {
     });
   }, [currentCategory, pushNavState, showToast]);
 
-  const handleSubmitScreenshot = useCallback(
+  const handleAdminOrderStatus = useCallback(
     async ({
-      amount,
-      screenshot,
-      app,
-    }: {
-      amount: number;
-      screenshot: string;
-      app: string;
-    }): Promise<boolean> => {
-      try {
-        const res = await fetch('/api/fund/submit-screenshot', {
-          method: 'POST',
-          credentials: 'same-origin',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ amount, screenshot, app }),
-        });
-        const data = (await res.json()) as {
-          ok?: boolean;
-          request?: PaymentFundRequest;
-          message?: string;
-        };
-        if (!res.ok || !data.ok || !data.request) {
-          showToast(data.message || 'Screenshot Submit Failed ❌', true);
-          return false;
-        }
-        prevPaymentStatusRef.current.set(data.request.id, data.request.status);
-        setPaymentRequests((prev) => [data.request!, ...prev]);
-        showToast('Screenshot Submitted ✅ Admin verify krke fund add kr dega');
-        return true;
-      } catch {
-        showToast('Network Error ❌ Try Again', true);
-        return false;
-      }
-    },
-    [showToast],
-  );
-
-  const handleAdminPaymentAction = useCallback(
-    async ({
-      id,
-      action,
+      orderId,
+      status,
       note,
     }: {
-      id: string;
-      action: 'approve' | 'wrong_payment';
+      orderId: string;
+      status: 'successful' | 'pending' | 'payment_failed';
       note?: string;
     }) => {
       playClickSound();
       try {
-        const res = await fetch('/api/admin/payment-action', {
+        const res = await fetch('/api/admin/order-status', {
           method: 'POST',
           credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id, action, note }),
+          body: JSON.stringify({ order_id: orderId, status, note }),
         });
-        const data = (await res.json()) as { ok?: boolean; message?: string };
-        if (!res.ok || !data.ok) {
-          showToast(data.message || 'Action failed ❌', true);
+        if (!res.ok) {
+          showToast('Failed to update order status ❌', true);
           return;
         }
-        showToast(
-          action === 'approve' ? 'Fund Added to User Wallet ✅' : 'Marked Wrong Payment ❌',
-          action !== 'approve',
-        );
+        const label =
+          status === 'successful'
+            ? 'Order Marked Successful ✅'
+            : status === 'payment_failed'
+              ? 'Order Marked Payment Failed ❌'
+              : 'Order Marked Pending ⏳';
+        showToast(label, status === 'payment_failed');
         await syncAdminOverview(false);
-        await syncUserState();
+        await syncUserState(false);
       } catch {
         showToast('Network Error ❌', true);
       }
@@ -646,112 +817,25 @@ export default function App() {
     [showToast, syncAdminOverview, syncUserState],
   );
 
-  const handleAdminOrderStatus = useCallback(
-    async (orderId: string, status: string) => {
+  const handleAdminDeleteOrder = useCallback(
+    async (orderId: string) => {
       playClickSound();
       try {
-        const res = await fetch('/api/admin/order-status', {
-          method: 'POST',
+        const res = await fetch(`/api/admin/orders/${encodeURIComponent(orderId)}`, {
+          method: 'DELETE',
           credentials: 'same-origin',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ order_id: orderId, status }),
         });
-        if (res.ok) {
-          showToast(`Order Status Updated: ${status.toUpperCase()}`);
-          await syncAdminOverview(false);
-          await syncUserState();
+        if (!res.ok) {
+          showToast('Delete failed ❌', true);
+          return;
         }
+        setAdminOrders((prev) => prev.filter((o) => o.order_id !== orderId));
+        showToast('Order Notification Deleted 🗑️');
       } catch {
-        showToast('Failed to update status ❌', true);
+        showToast('Network Error ❌', true);
       }
     },
-    [showToast, syncAdminOverview, syncUserState],
-  );
-
-  const handlePlaceOrder = useCallback(
-    async ({
-      link,
-      selectedPrice,
-      packIndex,
-    }: {
-      link: string;
-      selectedPrice: PriceTier | null;
-      packIndex: number | null;
-    }): Promise<boolean> => {
-      playClickSound();
-      if (!currentService) return false;
-
-      const validation = validateOrderPlacement({
-        link,
-        linkPrompt: currentService.link,
-        category: currentCategory,
-        serviceId: currentService.id,
-        selectedPrice,
-        balance,
-      });
-
-      if (!validation.ok) {
-        showToast(validation.message, true);
-        if (validation.reason === 'low_balance') {
-          handleGoFund();
-        }
-        return false;
-      }
-
-      if (!selectedPrice || packIndex === null) return false;
-
-      try {
-        const res = await fetch('/api/orders', {
-          method: 'POST',
-          credentials: 'same-origin',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            category: currentCategory,
-            serviceId: currentService.id,
-            packIndex,
-            link: link.trim(),
-          }),
-        });
-        const data = (await res.json()) as {
-          ok?: boolean;
-          order?: OrderItem;
-          balance?: number;
-          reason?: string;
-          message?: string;
-        };
-
-        if (!res.ok || !data.ok || !data.order) {
-          showToast(data.message || 'Low Balance ❌ Please Add Funds', true);
-          if (typeof data.balance === 'number') setBalance(data.balance);
-          if (data.reason !== 'invalid_link') {
-            handleGoFund();
-          }
-          return false;
-        }
-
-        setBalance(
-          typeof data.balance === 'number'
-            ? data.balance
-            : applyOrderDeduction(balance, selectedPrice.p),
-        );
-        setOrders((prev) => [data.order!, ...prev]);
-
-        showToast(`Order Successful ✅ ID #${data.order.id}`);
-        handleGoOrders();
-        return true;
-      } catch {
-        showToast('Network Error ❌ Try Again', true);
-        return false;
-      }
-    },
-    [
-      balance,
-      currentCategory,
-      currentService,
-      handleGoFund,
-      handleGoOrders,
-      showToast,
-    ],
+    [showToast],
   );
 
   const handleCopyUid = useCallback(() => {
@@ -790,6 +874,7 @@ export default function App() {
 
   const currentCatMeta =
     CATEGORIES.find((c) => c.key === currentCategory) ?? CATEGORIES[0];
+  const unreadNotifCount = countUnreadNotifications(notifications);
 
   return (
     <div className="min-h-screen bg-[#d8c7f5] pb-[120px]">
@@ -806,9 +891,9 @@ export default function App() {
       </div>
 
       <Header
-        balance={balance}
+        unreadCount={unreadNotifCount}
         onLogoClick={handleGoHome}
-        onWalletClick={handleGoFund}
+        onBellClick={handleOpenNotifications}
       />
 
       <main className="max-w-[460px] mx-auto px-[14px]">
@@ -831,29 +916,22 @@ export default function App() {
         {activePage === 'prices' && currentService && (
           <PricesView
             key={currentService.id}
-            service={currentService}
-            onBack={() => goBackOneStep('services')}
-            onPlaceOrder={handlePlaceOrder}
-          />
-        )}
-
-        {activePage === 'orders' && (
-          <OrdersView orders={orders} paymentRequests={paymentRequests} />
-        )}
-
-        {activePage === 'fund' && (
-          <FundView
             uid={uid}
-            paymentRequests={paymentRequests}
-            checkoutSession={checkoutSession}
-            onOpenCheckout={handleOpenCheckout}
+            service={currentService}
+            checkoutState={checkoutState}
+            processingOrder={processingOrder}
+            userToken={userToken}
+            onBack={() => goBackOneStep('services')}
+            onRequestCheckout={handleRequestDirectCheckout}
             onCloseCheckout={handleCloseCheckout}
-            onBack={() => goBackOneStep('home')}
+            onConfirmOrder={handleConfirmDirectOrder}
+            onAcknowledgeProcessing={handleAcknowledgeProcessing}
             onShowToast={showToast}
-            onSubmitScreenshot={handleSubmitScreenshot}
             onPlaySound={playClickSound}
           />
         )}
+
+        {activePage === 'orders' && <OrdersView orders={orders} />}
 
         {activePage === 'menu' && (
           <MenuView
@@ -867,18 +945,16 @@ export default function App() {
             onCopyUid={handleCopyUid}
             onSupportClick={handleOpenSupport}
             onGoOrders={handleGoOrders}
-            onGoFund={handleGoFund}
           />
         )}
 
         {activePage === 'admin' && isAdminLoggedIn && (
           <AdminView
-            paymentRequests={adminPaymentRequests}
             orders={adminOrders}
             onBack={() => goBackOneStep('menu')}
             onLogout={handleAdminLogout}
-            onPaymentAction={handleAdminPaymentAction}
             onOrderStatusChange={handleAdminOrderStatus}
+            onDeleteOrder={handleAdminDeleteOrder}
             onTestSound={() => {
               unlockAudioContext();
               playIphoneNotification3Sec();
@@ -887,6 +963,16 @@ export default function App() {
           />
         )}
       </main>
+
+      <NotificationsModal
+        isOpen={notificationsOpen}
+        notifications={notifications}
+        onClose={handleCloseNotifications}
+        onViewOrders={() => {
+          setNotificationsOpen(false);
+          handleGoOrders();
+        }}
+      />
 
       <SupportModal
         isOpen={supportOpen}
