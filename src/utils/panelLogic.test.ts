@@ -51,6 +51,44 @@ test('mergeAdminOrders keeps all non-deleted orders permanently across server re
   assert.equal(merged[0].order_id, 'ORD1');
 });
 
+test('mergeAdminOrders locks Admin Successful status against stale server polls until Admin changes it', () => {
+  const staleServerOrders = [
+    {
+      id: 1,
+      order_id: 'ORD_LOCK',
+      service: '1rs = 1k Reels Views',
+      pack: '1K Reels Views',
+      price: 1,
+      amount: 1,
+      link: 'https://instagram.com/reel/lock',
+      status: 'pending',
+      date: 'd',
+      createdAt: 1000,
+      uid: 'TRUST-1111',
+    },
+  ];
+  const mergedLocked = mergeAdminOrders({
+    serverOrders: staleServerOrders,
+    cachedOrders: [],
+    deletedIds: new Set(),
+    statusOverrides: {
+      ORD_LOCK: { status: 'successful', updatedAt: 2000 },
+    },
+  });
+  assert.equal(mergedLocked[0].status, 'successful');
+
+  // When Admin explicitly changes to payment_failed later, new override takes effect
+  const mergedChanged = mergeAdminOrders({
+    serverOrders: staleServerOrders,
+    cachedOrders: mergedLocked,
+    deletedIds: new Set(),
+    statusOverrides: {
+      ORD_LOCK: { status: 'payment_failed', updatedAt: 3000 },
+    },
+  });
+  assert.equal(mergedChanged[0].status, 'payment_failed');
+});
+
 test('formatIndianDateTime formats UTC timestamp in Asia/Kolkata IST', () => {
   const utcMs = Date.UTC(2026, 10, 18, 14, 12, 51);
   const formatted = formatIndianDateTime(utcMs).toLowerCase();
@@ -262,8 +300,9 @@ test('validateDirectOrderInput checks link and package without wallet balance ga
   );
 });
 
-test('getOrderStatusBadgeStyle returns expected labels for pending, successful, payment_failed', () => {
-  assert.equal(getOrderStatusBadgeStyle('pending').label, 'PENDING ⏳');
+test('getOrderStatusBadgeStyle returns expected labels for in_progress, pending, successful, payment_failed', () => {
+  assert.equal(getOrderStatusBadgeStyle('pending').label, 'IN PROGRESS ⏳');
+  assert.equal(getOrderStatusBadgeStyle('in_progress').label, 'IN PROGRESS ⏳');
   assert.equal(getOrderStatusBadgeStyle('successful').label, 'SUCCESSFUL ✅');
   assert.equal(getOrderStatusBadgeStyle('payment_failed').label, 'PAYMENT FAILED ❌');
 });

@@ -30,7 +30,7 @@ export interface CategoryMeta {
   icon: IconKind;
 }
 
-export type OrderStatus = 'pending' | 'successful' | 'payment_failed';
+export type OrderStatus = 'pending' | 'in_progress' | 'successful' | 'payment_failed';
 
 export interface OrderItem {
   id: number;
@@ -44,6 +44,7 @@ export interface OrderItem {
   adminMessage?: string;
   date: string;
   createdAt: number;
+  statusUpdatedAt?: number;
   uid: string;
   app?: string;
   paymentScreenshot?: string;

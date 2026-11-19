@@ -199,6 +199,7 @@ export interface StoredOrder {
   adminMessage?: string;
   date: string;
   createdAt: number;
+  statusUpdatedAt?: number;
   uid: string;
   app?: string;
   paymentScreenshot: string;
@@ -762,6 +763,7 @@ export function createApiApp() {
         adminMessage: o.adminMessage,
         date: o.date,
         createdAt: o.createdAt,
+        statusUpdatedAt: o.statusUpdatedAt,
         uid: o.uid,
         app: o.app,
         hasPaymentScreenshot: Boolean(o.paymentScreenshot),
@@ -1038,7 +1040,7 @@ export function createApiApp() {
     });
   });
 
-  // Admin updates order status (Successful / Pending / Payment Failed) & pushes customer bell notification
+  // Admin updates order status (Successful / In Progress / Payment Failed) & pushes customer bell notification
   app.post('/api/admin/order-status', async (req, res) => {
     if (!isAdminAuthenticated(req)) {
       res.status(401).json({ ok: false, message: 'Unauthorized' });
@@ -1052,7 +1054,9 @@ export function createApiApp() {
     let normalizedStatus: 'pending' | 'successful' | 'payment_failed' | null = null;
     if (rawStatus === 'successful' || rawStatus === 'completed') normalizedStatus = 'successful';
     else if (rawStatus === 'payment_failed' || rawStatus === 'failed') normalizedStatus = 'payment_failed';
-    else if (rawStatus === 'pending') normalizedStatus = 'pending';
+    else if (rawStatus === 'pending' || rawStatus === 'in_progress' || rawStatus === 'in progress') {
+      normalizedStatus = 'pending';
+    }
 
     if (!normalizedStatus) {
       res.status(400).json({ ok: false, message: 'Invalid status' });
@@ -1070,12 +1074,13 @@ export function createApiApp() {
         ? `Order #${target.id} Successful ✅`
         : normalizedStatus === 'payment_failed'
           ? `Order #${target.id} Payment Failed ❌`
-          : `Order #${target.id} is Pending ⏳`;
-
-    target.status = normalizedStatus;
-    target.adminMessage = note || defaultMsg;
+          : `Order #${target.id} is In Progress ⏳`;
 
     const now = Date.now();
+    target.status = normalizedStatus;
+    target.adminMessage = note || defaultMsg;
+    target.statusUpdatedAt = now;
+
     const notif: StoredNotification = {
       id: `NOTIF_${now}_${crypto.randomInt(100, 999)}`,
       uid: target.uid,

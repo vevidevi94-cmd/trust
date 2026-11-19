@@ -45,20 +45,45 @@ export function detectNewOrderIds(
     .map((order) => order.order_id);
 }
 
+export interface AdminStatusOverride {
+  status: string;
+  adminMessage?: string;
+  updatedAt: number;
+}
+
 export function mergeAdminOrders(params: {
   serverOrders: OrderItem[];
   cachedOrders: OrderItem[];
   deletedIds: Set<string>;
+  statusOverrides?: Record<string, AdminStatusOverride>;
 }): OrderItem[] {
+  const overrides = params.statusOverrides ?? {};
   const byId = new Map<string, OrderItem>();
+
+  const applyOverride = (order: OrderItem): OrderItem => {
+    const ov = overrides[order.order_id];
+    if (!ov) return order;
+    const serverUpdatedAt = typeof order.statusUpdatedAt === 'number' ? order.statusUpdatedAt : 0;
+    // Keep Admin's explicit status locked unless server carries a strictly newer explicit admin update
+    if (serverUpdatedAt <= ov.updatedAt) {
+      return {
+        ...order,
+        status: ov.status,
+        adminMessage: ov.adminMessage ?? order.adminMessage,
+        statusUpdatedAt: Math.max(serverUpdatedAt, ov.updatedAt),
+      };
+    }
+    return order;
+  };
+
   for (const order of params.serverOrders) {
     if (!params.deletedIds.has(order.order_id)) {
-      byId.set(order.order_id, order);
+      byId.set(order.order_id, applyOverride(order));
     }
   }
   for (const cached of params.cachedOrders) {
     if (!params.deletedIds.has(cached.order_id) && !byId.has(cached.order_id)) {
-      byId.set(cached.order_id, cached);
+      byId.set(cached.order_id, applyOverride(cached));
     }
   }
   return Array.from(byId.values()).sort(
@@ -269,7 +294,7 @@ export function getOrderStatusBadgeStyle(status: string): {
   ) {
     return { bg: '#f8d7da', color: '#721c24', label: 'PAYMENT FAILED ❌' };
   }
-  return { bg: '#fff3cd', color: '#856404', label: 'PENDING ⏳' };
+  return { bg: '#fff3cd', color: '#856404', label: 'IN PROGRESS ⏳' };
 }
 
 export function parseHashPage(hash: string): ActivePage {

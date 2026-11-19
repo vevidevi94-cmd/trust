@@ -40,7 +40,10 @@ export function AdminView({
   const [previewImg, setPreviewImg] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
-  const pendingCount = orders.filter((o) => o.status.toLowerCase() === 'pending').length;
+  const inProgressCount = orders.filter((o) => {
+    const s = o.status.toLowerCase();
+    return s === 'pending' || s === 'in_progress';
+  }).length;
 
   const handleStatusClick = async (
     orderId: string,
@@ -108,7 +111,7 @@ export function AdminView({
       </h1>
 
       <div className="text-center text-[12.5px] font-bold text-[#3a1d6d] mb-3">
-        Live Orders: {orders.length} ({pendingCount} Pending)
+        Live Orders: {orders.length} ({inProgressCount} In Progress)
       </div>
 
       <div className="space-y-3" data-testid="admin-orders-list">
@@ -123,7 +126,7 @@ export function AdminView({
             const isCopied = copiedId === order.order_id;
             const currentStatus = order.status.toLowerCase();
             const isSuccessful = currentStatus === 'successful' || currentStatus === 'completed';
-            const isPending = currentStatus === 'pending';
+            const isInProgress = currentStatus === 'pending' || currentStatus === 'in_progress';
             const isFailed = currentStatus === 'payment_failed' || currentStatus === 'failed';
             return (
               <div
@@ -244,20 +247,20 @@ export function AdminView({
                     <button
                       type="button"
                       disabled={isBusy}
-                      aria-pressed={isPending}
+                      aria-pressed={isInProgress}
                       onClick={() => handleStatusClick(order.order_id, 'pending')}
                       className={`py-2 px-1.5 rounded-[10px] text-[11px] font-extrabold inline-flex items-center justify-center gap-1 cursor-pointer disabled:opacity-60 active:scale-[0.98] whitespace-nowrap transition-transform ${
-                        isPending
+                        isInProgress
                           ? 'bg-[#f59e0b] text-white ring-2 ring-[#b45309] ring-offset-1 shadow-md'
                           : 'bg-[#fff8e1] text-[#b45309] border border-[#ffe082] hover:bg-[#ffecb3]'
                       }`}
                     >
-                      {isPending ? (
+                      {isInProgress ? (
                         <Check className="w-3.5 h-3.5 shrink-0 stroke-[3.2]" aria-hidden="true" />
                       ) : (
                         <Clock className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
                       )}
-                      <span>Pending</span>
+                      <span>In Progress</span>
                     </button>
                     <button
                       type="button"

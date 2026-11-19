@@ -16,6 +16,7 @@ import {
   parseHashPage,
   validateDirectOrderInput,
   type ActivePage,
+  type AdminStatusOverride,
 } from './utils/panelLogic';
 import {
   playClickSound,
@@ -48,6 +49,7 @@ const STORAGE_ORDERS_CACHE_KEY = 'tp_orders_cache_v2';
 const STORAGE_NOTIFS_CACHE_KEY = 'tp_notifs_cache_v2';
 const STORAGE_ADMIN_ORDERS_CACHE_KEY = 'tp_admin_orders_cache_v2';
 const STORAGE_ADMIN_DELETED_IDS_KEY = 'tp_admin_deleted_ids_v2';
+const STORAGE_ADMIN_STATUS_OVERRIDES_KEY = 'tp_admin_status_overrides_v1';
 const LIVE_CHANNEL_NAME = 'trustedpanel_live_sync_v1';
 
 function readSavedUserToken(): string {
@@ -97,6 +99,25 @@ function readAdminDeletedIds(): string[] {
 function saveAdminDeletedIds(ids: string[]): void {
   try {
     localStorage.setItem(STORAGE_ADMIN_DELETED_IDS_KEY, JSON.stringify(ids));
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+function readAdminStatusOverrides(): Record<string, AdminStatusOverride> {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(STORAGE_ADMIN_STATUS_OVERRIDES_KEY) || '{}');
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, AdminStatusOverride>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveAdminStatusOverrides(overrides: Record<string, AdminStatusOverride>): void {
+  try {
+    localStorage.setItem(STORAGE_ADMIN_STATUS_OVERRIDES_KEY, JSON.stringify(overrides));
   } catch {
     // Ignore storage errors
   }
@@ -193,6 +214,7 @@ export default function App() {
   const knownCustomerNotifIdsRef = useRef<Set<string> | null>(null);
   const historyDepthRef = useRef<number>(0);
   const initialHashPageRef = useRef<ActivePage>(parseHashPage(window.location.hash));
+  const adminSyncSeqRef = useRef<number>(0);
 
   const showToast = useCallback((message: string, isError = false) => {
     if (toastTimerRef.current !== null) {
@@ -456,11 +478,13 @@ export default function App() {
   const syncAdminOverview = useCallback(
     async (isInitialPoll = false) => {
       if (!isAdminLoggedIn) return;
+      const reqSeq = ++adminSyncSeqRef.current;
       try {
         const res = await fetch('/api/admin/overview', {
           credentials: 'same-origin',
           cache: 'no-store',
         });
+        if (reqSeq !== adminSyncSeqRef.current) return;
         if (res.status === 401) {
           setIsAdminLoggedIn(false);
           return;
@@ -470,14 +494,16 @@ export default function App() {
           ok?: boolean;
           orders?: OrderItem[];
         };
-        if (!data.ok) return;
+        if (reqSeq !== adminSyncSeqRef.current || !data.ok) return;
 
         const incomingOrders = Array.isArray(data.orders) ? data.orders : [];
         const deletedIds = new Set(readAdminDeletedIds());
+        const statusOverrides = readAdminStatusOverrides();
         const merged = mergeAdminOrders({
           serverOrders: incomingOrders,
           cachedOrders: readCachedAdminOrders(),
           deletedIds,
+          statusOverrides,
         });
 
         if (knownAdminOrderIdsRef.current === null || isInitialPoll) {
@@ -520,6 +546,7 @@ export default function App() {
       serverOrders: [],
       cachedOrders: readCachedAdminOrders(),
       deletedIds,
+      statusOverrides: readAdminStatusOverrides(),
     });
     if (initialCached.length > 0) {
       setAdminOrders(initialCached);
@@ -936,6 +963,26 @@ export default function App() {
       note?: string;
     }) => {
       playClickSound();
+      const updatedAt = Date.now();
+      // Invalidate any in-flight poll response that started before Admin's click
+      adminSyncSeqRef.current += 1;
+
+      // Lock Admin's explicit status choice immediately in persistent storage so it never reverts
+      const nextOverrides = {
+        ...readAdminStatusOverrides(),
+        [orderId]: { status, adminMessage: note, updatedAt },
+      };
+      saveAdminStatusOverrides(nextOverrides);
+      setAdminOrders((prev) => {
+        const next = prev.map((o) =>
+          o.order_id === orderId
+            ? { ...o, status, adminMessage: note || o.adminMessage, statusUpdatedAt: updatedAt }
+            : o,
+        );
+        saveCachedAdminOrders(next);
+        return next;
+      });
+
       try {
         const res = await fetch('/api/admin/order-status', {
           method: 'POST',
@@ -948,23 +995,12 @@ export default function App() {
           return;
         }
 
-        // Optimistically persist the selected status & tick immediately
-        setAdminOrders((prev) => {
-          const next = prev.map((o) =>
-            o.order_id === orderId
-              ? { ...o, status, adminMessage: note || o.adminMessage }
-              : o,
-          );
-          saveCachedAdminOrders(next);
-          return next;
-        });
-
         const label =
           status === 'successful'
             ? 'Order Marked Successful ✅'
             : status === 'payment_failed'
               ? 'Order Marked Payment Failed ❌'
-              : 'Order Marked Pending ⏳';
+              : 'Order Marked In Progress ⏳';
         showToast(label, status === 'payment_failed');
         broadcastLiveSignal('order_updated');
         await syncAdminOverview(false);
@@ -979,6 +1015,7 @@ export default function App() {
   const handleAdminDeleteOrder = useCallback(
     async (orderId: string) => {
       playClickSound();
+      adminSyncSeqRef.current += 1;
       try {
         const res = await fetch(`/api/admin/orders/${encodeURIComponent(orderId)}`, {
           method: 'DELETE',
@@ -990,6 +1027,11 @@ export default function App() {
         }
         const nextDeleted = Array.from(new Set([...readAdminDeletedIds(), orderId]));
         saveAdminDeletedIds(nextDeleted);
+        const overrides = readAdminStatusOverrides();
+        if (orderId in overrides) {
+          delete overrides[orderId];
+          saveAdminStatusOverrides(overrides);
+        }
         setAdminOrders((prev) => {
           const next = prev.filter((o) => o.order_id !== orderId);
           saveCachedAdminOrders(next);
