@@ -3,11 +3,14 @@ import express, { type Request, type Response } from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import QRCode from 'qrcode';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const ADMIN_PASS = process.env.ADMIN_PASSWORD || 'banti&1945';
+const UPI_ID = process.env.UPI_ID || 'skiend@axl';
+const UPI_PAYEE_NAME = process.env.UPI_PAYEE_NAME || 'TrustedPanel';
 const FIREBASE_RTDB_URL =
   process.env.FIREBASE_RTDB_URL ||
   'https://trusted-91b2d-default-rtdb.asia-southeast1.firebasedatabase.app';
@@ -226,6 +229,41 @@ interface StoreData {
   orders: StoredOrder[];
   notifications: StoredNotification[];
   orderCounter: number;
+  catalogOverrides?: Record<string, ServerServiceItem[]>;
+  posterImage?: string | null;
+}
+
+function cloneDefaultCatalog(): Record<string, ServerServiceItem[]> {
+  return JSON.parse(JSON.stringify(SERVER_CATALOG)) as Record<string, ServerServiceItem[]>;
+}
+
+function getLiveCatalog(store: StoreData): Record<string, ServerServiceItem[]> {
+  const base = cloneDefaultCatalog();
+  if (!store.catalogOverrides || typeof store.catalogOverrides !== 'object') {
+    return base;
+  }
+  for (const catKey of Object.keys(base)) {
+    const customList = store.catalogOverrides[catKey];
+    if (!Array.isArray(customList) || customList.length === 0) continue;
+    const customById = new Map<string, ServerServiceItem>();
+    for (const svc of customList) {
+      if (svc && typeof svc.id === 'string' && typeof svc.name === 'string' && Array.isArray(svc.prices) && svc.prices.length > 0) {
+        customById.set(svc.id, svc);
+      }
+    }
+    base[catKey] = base[catKey].map((defSvc) => {
+      const custom = customById.get(defSvc.id);
+      if (!custom) return defSvc;
+      return {
+        id: defSvc.id,
+        name: custom.name.trim() || defSvc.name,
+        prices: custom.prices
+          .filter((tier) => tier && typeof tier.q === 'string' && tier.q.trim() && Number.isFinite(Number(tier.p)) && Number(tier.p) >= 1)
+          .map((tier) => ({ q: tier.q.trim(), p: Math.round(Number(tier.p) * 100) / 100 })),
+      };
+    }).map((svc) => (svc.prices.length > 0 ? svc : base[catKey].find((d) => d.id === svc.id) || svc));
+  }
+  return base;
 }
 
 function formatIndianDateTime(timestampMs: number): string {
@@ -383,12 +421,17 @@ function loadStore(): StoreData {
           typeof parsed.orderCounter === 'number' && parsed.orderCounter > maxId
             ? parsed.orderCounter
             : maxId + 1,
+        catalogOverrides:
+          parsed.catalogOverrides && typeof parsed.catalogOverrides === 'object'
+            ? parsed.catalogOverrides
+            : undefined,
+        posterImage: typeof parsed.posterImage === 'string' ? parsed.posterImage : null,
       };
     }
   } catch {
     // Fallback to clean store
   }
-  return { knownUsers: {}, orders: [], notifications: [], orderCounter: 1 };
+  return { knownUsers: {}, orders: [], notifications: [], orderCounter: 1, posterImage: null };
 }
 
 function saveStore(store: StoreData): void {
@@ -666,6 +709,23 @@ export function createApiApp() {
     }
   }
 
+  function broadcastToAllUsers(event: string, data: unknown): void {
+    for (const clients of userSseClients.values()) {
+      for (const client of clients) {
+        sendSse(client, event, data);
+      }
+    }
+  }
+
+  // Public live catalog & poster endpoint (reflects Admin edits immediately)
+  app.get('/api/catalog', (_req, res) => {
+    res.json({
+      ok: true,
+      catalog: getLiveCatalog(store),
+      posterImage: store.posterImage || null,
+    });
+  });
+
   function pruneTokens() {
     const now = Date.now();
     for (const [jti, exp] of usedQrTokens.entries()) {
@@ -809,7 +869,8 @@ export function createApiApp() {
     const packIndex = Number(req.body?.packIndex);
     const link = String(req.body?.link || '').trim();
 
-    const catServices = SERVER_CATALOG[category];
+    const liveCatalog = getLiveCatalog(store);
+    const catServices = liveCatalog[category];
     const service = catServices?.find((s) => s.id === serviceId);
     if (!service || !Number.isInteger(packIndex) || packIndex < 0 || packIndex >= service.prices.length) {
       res.status(400).json({ ok: false, message: 'Invalid service or package selected ❌' });
@@ -846,8 +907,8 @@ export function createApiApp() {
     });
   });
 
-  // Serve protected QR image once per checkout token (never exposed publicly)
-  app.get('/api/order/qr', (req, res) => {
+  // Serve dynamic UPI QR image with exact live amount encoded inside (UPI ID never leaves server)
+  app.get('/api/order/qr', async (req, res) => {
     pruneTokens();
     const session = getVerifiedUserSession(req);
     if (!session) {
@@ -855,7 +916,7 @@ export function createApiApp() {
       return;
     }
     const token = typeof req.query.token === 'string' ? req.query.token : '';
-    const decoded = verifyToken<{ uid?: string; sid?: string; jti?: string; exp?: number }>(token);
+    const decoded = verifyToken<{ uid?: string; sid?: string; amt?: number; jti?: string; exp?: number }>(token);
     if (
       !decoded ||
       decoded.uid !== session.uid ||
@@ -867,21 +928,42 @@ export function createApiApp() {
       return;
     }
 
-    const qrPath = resolveQrImagePath();
-    if (!qrPath) {
-      res.status(404).send('Not found');
-      return;
-    }
-
     usedQrTokens.set(decoded.jti, typeof decoded.exp === 'number' ? decoded.exp : Date.now() + 300_000);
 
-    res.setHeader('Content-Type', 'image/jpeg');
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
-    res.setHeader('Content-Disposition', 'inline');
-    fs.createReadStream(qrPath).pipe(res);
+    const amountNum = typeof decoded.amt === 'number' && Number.isFinite(decoded.amt) && decoded.amt > 0 ? decoded.amt : 1;
+    const amountParam = Number.isInteger(amountNum) ? String(amountNum) : amountNum.toFixed(2);
+    const upiUri = `upi://pay?pa=${encodeURIComponent(UPI_ID)}&pn=${encodeURIComponent(UPI_PAYEE_NAME)}&am=${encodeURIComponent(amountParam)}&cu=INR`;
+
+    try {
+      const pngBuffer = await QRCode.toBuffer(upiUri, {
+        type: 'png',
+        width: 480,
+        margin: 2,
+        errorCorrectionLevel: 'M',
+        color: {
+          dark: '#000000',
+          light: '#FFFFFF',
+        },
+      });
+      res.setHeader('Content-Type', 'image/png');
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+      res.setHeader('Content-Disposition', 'inline');
+      res.send(pngBuffer);
+      return;
+    } catch {
+      const qrPath = resolveQrImagePath();
+      if (!qrPath) {
+        res.status(404).send('Not found');
+        return;
+      }
+      res.setHeader('Content-Type', 'image/jpeg');
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+      res.setHeader('Content-Disposition', 'inline');
+      fs.createReadStream(qrPath).pipe(res);
+    }
   });
 
-  // Direct order placement with payment screenshot (no wallet/add-fund step)
+  // Direct order placement with payment screenshot (uses live Admin-configured prices)
   app.post('/api/orders', async (req, res) => {
     const session = getOrIssueUserSession(req, res, store);
     const category = String(req.body?.category || '').trim();
@@ -890,7 +972,8 @@ export function createApiApp() {
     const link = String(req.body?.link || '').trim();
     const appName = String(req.body?.app || 'UPI').trim().slice(0, 30);
 
-    const catServices = SERVER_CATALOG[category];
+    const liveCatalog = getLiveCatalog(store);
+    const catServices = liveCatalog[category];
     const service = catServices?.find((s) => s.id === serviceId);
     if (!service || !Number.isInteger(packIndex) || packIndex < 0 || packIndex >= service.prices.length) {
       res.status(400).json({ ok: false, message: 'Invalid service or package selected ❌' });
@@ -1135,6 +1218,167 @@ export function createApiApp() {
 
     broadcastToAdmins('order_deleted', { order_id: orderId });
     res.json({ ok: true, order_id: orderId });
+  });
+
+  // Admin sends a direct message to customer on an order without changing its current status
+  app.post('/api/admin/order-message', (req, res) => {
+    if (!isAdminAuthenticated(req)) {
+      res.status(401).json({ ok: false, message: 'Unauthorized' });
+      return;
+    }
+
+    const orderId = String(req.body?.order_id || '').trim();
+    const message = String(req.body?.message || '').trim().slice(0, 200);
+    if (!message) {
+      res.status(400).json({ ok: false, message: 'Message type karo ❌' });
+      return;
+    }
+
+    const target = store.orders.find((o) => o.order_id === orderId);
+    if (!target) {
+      res.status(404).json({ ok: false, message: 'Order not found' });
+      return;
+    }
+
+    const now = Date.now();
+    target.adminMessage = message;
+
+    const notif: StoredNotification = {
+      id: `NOTIF_${now}_${crypto.randomInt(100, 999)}`,
+      uid: target.uid,
+      orderId: target.order_id,
+      orderNum: target.id,
+      service: target.service,
+      pack: target.pack,
+      status: target.status,
+      message,
+      date: formatIndianDateTime(now),
+      createdAt: now,
+      read: false,
+    };
+
+    store.notifications.unshift(notif);
+    saveStore(store);
+
+    broadcastToAdmins('order_updated', {
+      order_id: target.order_id,
+      status: target.status,
+      adminMessage: target.adminMessage,
+    });
+    broadcastToUser(target.uid, 'notification', {
+      id: notif.id,
+      orderId: target.order_id,
+      status: target.status,
+      message: notif.message,
+    });
+
+    void syncToFirebase(`orders/${target.order_id}/adminMessage`, target.adminMessage);
+    void syncToFirebase(`notifications/${target.uid}/${notif.id}`, notif);
+
+    res.json({ ok: true, order: target, notification: notif });
+  });
+
+  // Admin edits live service names, packages & prices (auto-updates scanner amount too)
+  app.post('/api/admin/catalog', (req, res) => {
+    if (!isAdminAuthenticated(req)) {
+      res.status(401).json({ ok: false, message: 'Unauthorized' });
+      return;
+    }
+
+    if (req.body?.reset === true) {
+      store.catalogOverrides = undefined;
+      saveStore(store);
+      const liveCatalog = getLiveCatalog(store);
+      broadcastToAdmins('catalog_updated', { ts: Date.now() });
+      broadcastToAllUsers('catalog_updated', { ts: Date.now() });
+      void syncToFirebase('config/catalog', liveCatalog);
+      res.json({ ok: true, catalog: liveCatalog });
+      return;
+    }
+
+    const incoming = req.body?.catalog;
+    if (!incoming || typeof incoming !== 'object') {
+      res.status(400).json({ ok: false, message: 'Invalid catalog payload ❌' });
+      return;
+    }
+
+    const nextOverrides: Record<string, ServerServiceItem[]> = getLiveCatalog(store);
+    for (const catKey of Object.keys(SERVER_CATALOG)) {
+      const catList = incoming[catKey];
+      if (!Array.isArray(catList)) continue;
+
+      const defaultById = new Map(SERVER_CATALOG[catKey].map((s) => [s.id, s]));
+      const updatedCat: ServerServiceItem[] = [];
+      for (const rawSvc of catList) {
+        if (!rawSvc || typeof rawSvc.id !== 'string' || !defaultById.has(rawSvc.id)) continue;
+        const cleanName = String(rawSvc.name || '').trim().slice(0, 80);
+        if (!cleanName) {
+          res.status(400).json({ ok: false, message: 'Service name khali nahi ho sakta ❌' });
+          return;
+        }
+        const rawPrices = Array.isArray(rawSvc.prices) ? rawSvc.prices : [];
+        const cleanPrices: ServerPriceTier[] = [];
+        for (const tier of rawPrices) {
+          const q = String(tier?.q || '').trim().slice(0, 60);
+          const pNum = Number(tier?.p);
+          if (!q || !Number.isFinite(pNum) || pNum < 1 || pNum > 100_000) {
+            res.status(400).json({ ok: false, message: 'Har package ka naam aur valid price (₹1+) enter karo ❌' });
+            return;
+          }
+          cleanPrices.push({ q, p: Math.round(pNum * 100) / 100 });
+        }
+        if (cleanPrices.length === 0) {
+          res.status(400).json({ ok: false, message: 'Har service me kam se kam 1 package hona chahiye ❌' });
+          return;
+        }
+        updatedCat.push({ id: rawSvc.id, name: cleanName, prices: cleanPrices });
+      }
+      if (updatedCat.length > 0) {
+        nextOverrides[catKey] = updatedCat;
+      }
+    }
+
+    store.catalogOverrides = nextOverrides;
+    saveStore(store);
+    const liveCatalog = getLiveCatalog(store);
+
+    broadcastToAdmins('catalog_updated', { ts: Date.now() });
+    broadcastToAllUsers('catalog_updated', { ts: Date.now() });
+    void syncToFirebase('config/catalog', liveCatalog);
+
+    res.json({ ok: true, catalog: liveCatalog });
+  });
+
+  // Admin changes Home Offer Poster live (or resets to default)
+  app.post('/api/admin/poster', (req, res) => {
+    if (!isAdminAuthenticated(req)) {
+      res.status(401).json({ ok: false, message: 'Unauthorized' });
+      return;
+    }
+
+    if (req.body?.reset === true || req.body?.posterImage === null) {
+      store.posterImage = null;
+      saveStore(store);
+      broadcastToAdmins('catalog_updated', { ts: Date.now() });
+      broadcastToAllUsers('catalog_updated', { ts: Date.now() });
+      void syncToFirebase('config/poster', null);
+      res.json({ ok: true, posterImage: null });
+      return;
+    }
+
+    const imgCheck = sanitizeScreenshotDataUrl(req.body?.posterImage);
+    if (!imgCheck.ok) {
+      res.status(400).json({ ok: false, message: 'Valid poster image (PNG/JPG/WEBP, Max 1.5MB) upload karo ❌' });
+      return;
+    }
+
+    store.posterImage = imgCheck.dataUrl;
+    saveStore(store);
+    broadcastToAdmins('catalog_updated', { ts: Date.now() });
+    broadcastToAllUsers('catalog_updated', { ts: Date.now() });
+    void syncToFirebase('config/poster', store.posterImage);
+
+    res.json({ ok: true, posterImage: store.posterImage });
   });
 
   return app;

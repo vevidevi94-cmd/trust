@@ -7,15 +7,20 @@ import {
   Copy,
   Eye,
   LogOut,
+  Send,
+  SlidersHorizontal,
   Trash2,
   X,
   XCircle,
 } from 'lucide-react';
-import type { OrderItem } from '../data/services';
+import type { CategoryKey, OrderItem, ServiceItem } from '../data/services';
 import { formatIndianDateTime, getOrderStatusBadgeStyle } from '../utils/panelLogic';
+import { AdminCatalogEditor } from './AdminCatalogEditor';
 
 interface AdminViewProps {
   orders: OrderItem[];
+  catalog: Record<CategoryKey, ServiceItem[]>;
+  posterImage: string | null;
   onBack: () => void;
   onLogout: () => void;
   onOrderStatusChange: (params: {
@@ -23,19 +28,36 @@ interface AdminViewProps {
     status: 'successful' | 'pending' | 'payment_failed';
     note?: string;
   }) => Promise<void>;
+  onSendOrderMessage: (params: {
+    orderId: string;
+    message: string;
+  }) => Promise<boolean>;
   onDeleteOrder: (orderId: string) => Promise<void>;
+  onSaveCatalog: (catalog: Record<CategoryKey, ServiceItem[]>) => Promise<boolean>;
+  onResetCatalog: () => Promise<boolean>;
+  onSavePoster: (posterDataUrl: string | null) => Promise<boolean>;
+  onShowToast: (message: string, isError?: boolean) => void;
   onTestSound: () => void;
 }
 
 export function AdminView({
   orders,
+  catalog,
+  posterImage,
   onBack,
   onLogout,
   onOrderStatusChange,
+  onSendOrderMessage,
   onDeleteOrder,
+  onSaveCatalog,
+  onResetCatalog,
+  onSavePoster,
+  onShowToast,
   onTestSound,
 }: AdminViewProps) {
+  const [activeTab, setActiveTab] = useState<'orders' | 'catalog'>('orders');
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [sendingMsgId, setSendingMsgId] = useState<string | null>(null);
   const [notesById, setNotesById] = useState<Record<string, string>>({});
   const [previewImg, setPreviewImg] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
@@ -56,6 +78,20 @@ export function AdminView({
       note: notesById[orderId]?.trim() || undefined,
     });
     setBusyId(null);
+  };
+
+  const handleSendMessageClick = async (orderId: string) => {
+    const text = (notesById[orderId] || '').trim();
+    if (!text) {
+      onShowToast('Pehle customer ke liye message type karo ❌', true);
+      return;
+    }
+    setSendingMsgId(orderId);
+    const ok = await onSendOrderMessage({ orderId, message: text });
+    setSendingMsgId(null);
+    if (ok) {
+      setNotesById((prev) => ({ ...prev, [orderId]: '' }));
+    }
   };
 
   const handleDeleteClick = async (orderId: string) => {
@@ -105,16 +141,56 @@ export function AdminView({
 
       <h1
         id="admin-panel-heading"
-        className="text-[28px] font-extrabold text-[#3a1d6d] text-center my-[10px] mb-[6px]"
+        className="text-[28px] font-extrabold text-[#3a1d6d] text-center my-[10px] mb-[8px]"
       >
         Admin Panel
       </h1>
 
-      <div className="text-center text-[12.5px] font-bold text-[#3a1d6d] mb-3">
-        Live Orders: {orders.length} ({inProgressCount} In Progress)
+      {/* Admin Mode Tabs */}
+      <div className="bg-white rounded-[16px] p-1.5 shadow-sm grid grid-cols-2 gap-1.5 mb-3">
+        <button
+          type="button"
+          aria-pressed={activeTab === 'orders'}
+          onClick={() => setActiveTab('orders')}
+          className={`py-2 px-2 rounded-[12px] text-[12.5px] font-extrabold cursor-pointer transition-colors ${
+            activeTab === 'orders'
+              ? 'bg-[#7c4dff] text-white shadow-sm'
+              : 'bg-transparent text-[#3a1d6d] hover:bg-[#f3edff]'
+          }`}
+        >
+          Live Orders ({orders.length})
+        </button>
+        <button
+          type="button"
+          aria-pressed={activeTab === 'catalog'}
+          onClick={() => setActiveTab('catalog')}
+          className={`py-2 px-2 rounded-[12px] text-[12.5px] font-extrabold inline-flex items-center justify-center gap-1.5 cursor-pointer transition-colors ${
+            activeTab === 'catalog'
+              ? 'bg-[#7c4dff] text-white shadow-sm'
+              : 'bg-transparent text-[#3a1d6d] hover:bg-[#f3edff]'
+          }`}
+        >
+          <SlidersHorizontal className="w-3.5 h-3.5" aria-hidden="true" />
+          <span>Edit Services &amp; Poster</span>
+        </button>
       </div>
 
-      <div className="space-y-3" data-testid="admin-orders-list">
+      {activeTab === 'catalog' ? (
+        <AdminCatalogEditor
+          catalog={catalog}
+          posterImage={posterImage}
+          onSaveCatalog={onSaveCatalog}
+          onResetCatalog={onResetCatalog}
+          onSavePoster={onSavePoster}
+          onShowToast={onShowToast}
+        />
+      ) : (
+        <>
+          <div className="text-center text-[12.5px] font-bold text-[#3a1d6d] mb-3">
+            Live Orders: {orders.length} ({inProgressCount} In Progress)
+          </div>
+
+          <div className="space-y-3" data-testid="admin-orders-list">
         {orders.length === 0 ? (
           <div className="bg-white rounded-[18px] p-6 text-center text-[#555] text-[14px]">
             Abhi koi live order notification nahi aayi hai.
@@ -215,15 +291,40 @@ export function AdminView({
                 </div>
 
                 <div className="mt-2.5 space-y-2">
-                  <input
-                    type="text"
-                    value={notesById[order.order_id] || ''}
-                    onChange={(e) =>
-                      setNotesById((prev) => ({ ...prev, [order.order_id]: e.target.value }))
-                    }
-                    placeholder="Optional message for customer..."
-                    className="w-full px-3 py-2 text-[12px] border border-[#e9dffc] rounded-[10px] outline-none focus:border-[#7c4dff]"
-                  />
+                  {order.adminMessage && (
+                    <div className="text-[11.5px] font-bold text-[#3a1d6d] bg-[#f8f5ff] border border-[#e9dffc] rounded-[8px] px-2.5 py-1.5">
+                      Last Sent: <span className="text-[#7c4dff]">{order.adminMessage}</span>
+                    </div>
+                  )}
+
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      type="text"
+                      aria-label={`Message for Order #${order.id}`}
+                      value={notesById[order.order_id] || ''}
+                      onChange={(e) =>
+                        setNotesById((prev) => ({ ...prev, [order.order_id]: e.target.value }))
+                      }
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          void handleSendMessageClick(order.order_id);
+                        }
+                      }}
+                      placeholder="Message for customer..."
+                      className="flex-1 min-w-0 px-3 py-2 text-[12px] border border-[#e9dffc] rounded-[10px] outline-none focus:border-[#7c4dff]"
+                    />
+                    <button
+                      type="button"
+                      disabled={sendingMsgId === order.order_id}
+                      aria-label={`Send message for Order #${order.id}`}
+                      onClick={() => handleSendMessageClick(order.order_id)}
+                      className="bg-[#7c4dff] text-white px-3 py-2 rounded-[10px] text-[12px] font-extrabold inline-flex items-center gap-1 cursor-pointer shrink-0 active:scale-95 disabled:opacity-60"
+                    >
+                      <Send className="w-3.5 h-3.5" aria-hidden="true" />
+                      <span>{sendingMsgId === order.order_id ? '...' : 'Send'}</span>
+                    </button>
+                  </div>
 
                   <div className="grid grid-cols-3 gap-1.5">
                     <button
@@ -286,7 +387,9 @@ export function AdminView({
             );
           })
         )}
-      </div>
+          </div>
+        </>
+      )}
 
       {previewImg && (
         <div

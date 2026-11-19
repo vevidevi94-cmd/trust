@@ -3,6 +3,7 @@ import type {
   CustomerNotification,
   OrderItem,
   PriceTier,
+  ServiceItem,
 } from '../data/services';
 
 export type ActivePage = 'home' | 'services' | 'prices' | 'orders' | 'menu' | 'admin';
@@ -303,4 +304,76 @@ export function parseHashPage(hash: string): ActivePage {
   if (clean === 'menu') return 'menu';
   if (clean === 'admin') return 'admin';
   return 'home';
+}
+
+export interface ServiceCatalogOverrideItem {
+  id: string;
+  name: string;
+  prices: PriceTier[];
+}
+
+export function mergeLiveCatalog(
+  baseCatalog: Record<CategoryKey, ServiceItem[]>,
+  serverCatalog?: Record<string, ServiceCatalogOverrideItem[]> | null,
+): Record<CategoryKey, ServiceItem[]> {
+  const categories: CategoryKey[] = ['instagram', 'facebook', 'telegram', 'youtube'];
+  const result = {} as Record<CategoryKey, ServiceItem[]>;
+
+  for (const cat of categories) {
+    const baseList = baseCatalog[cat] || [];
+    const overrideList = serverCatalog?.[cat];
+    const overrideById = new Map<string, ServiceCatalogOverrideItem>();
+    if (Array.isArray(overrideList)) {
+      for (const item of overrideList) {
+        if (item && typeof item.id === 'string') {
+          overrideById.set(item.id, item);
+        }
+      }
+    }
+
+    result[cat] = baseList.map((baseSvc) => {
+      const ov = overrideById.get(baseSvc.id);
+      if (!ov) {
+        return { ...baseSvc, prices: baseSvc.prices.map((p) => ({ ...p })) };
+      }
+      const cleanPrices = Array.isArray(ov.prices)
+        ? ov.prices
+            .filter((t) => t && typeof t.q === 'string' && t.q.trim() && Number.isFinite(Number(t.p)) && Number(t.p) >= 1)
+            .map((t) => ({ q: t.q.trim(), p: Math.round(Number(t.p) * 100) / 100 }))
+        : [];
+      return {
+        ...baseSvc,
+        name: typeof ov.name === 'string' && ov.name.trim() ? ov.name.trim() : baseSvc.name,
+        prices: cleanPrices.length > 0 ? cleanPrices : baseSvc.prices.map((p) => ({ ...p })),
+      };
+    });
+  }
+
+  return result;
+}
+
+export function validateCatalogServiceEdit(params: {
+  name: string;
+  prices: Array<{ q: string; p: number }>;
+}): { ok: true; name: string; prices: PriceTier[] } | { ok: false; message: string } {
+  const name = params.name.trim();
+  if (!name) {
+    return { ok: false, message: 'Service ka naam khali nahi ho sakta ❌' };
+  }
+  if (!Array.isArray(params.prices) || params.prices.length === 0) {
+    return { ok: false, message: 'Kam se kam 1 package hona chahiye ❌' };
+  }
+  const cleaned: PriceTier[] = [];
+  for (const tier of params.prices) {
+    const q = String(tier.q || '').trim();
+    const p = Number(tier.p);
+    if (!q) {
+      return { ok: false, message: 'Har package ka naam enter karo ❌' };
+    }
+    if (!Number.isFinite(p) || p < 1 || p > 100_000) {
+      return { ok: false, message: 'Price ₹1 se ₹1,00,000 ke beech hona chahiye ❌' };
+    }
+    cleaned.push({ q, p: Math.round(p * 100) / 100 });
+  }
+  return { ok: true, name, prices: cleaned };
 }

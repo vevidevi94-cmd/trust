@@ -13,10 +13,12 @@ import {
   countUnreadNotifications,
   detectNewOrderIds,
   mergeAdminOrders,
+  mergeLiveCatalog,
   parseHashPage,
   validateDirectOrderInput,
   type ActivePage,
   type AdminStatusOverride,
+  type ServiceCatalogOverrideItem,
 } from './utils/panelLogic';
 import {
   playClickSound,
@@ -50,6 +52,8 @@ const STORAGE_NOTIFS_CACHE_KEY = 'tp_notifs_cache_v2';
 const STORAGE_ADMIN_ORDERS_CACHE_KEY = 'tp_admin_orders_cache_v2';
 const STORAGE_ADMIN_DELETED_IDS_KEY = 'tp_admin_deleted_ids_v2';
 const STORAGE_ADMIN_STATUS_OVERRIDES_KEY = 'tp_admin_status_overrides_v1';
+const STORAGE_LIVE_CATALOG_KEY = 'tp_live_catalog_v1';
+const STORAGE_LIVE_POSTER_KEY = 'tp_live_poster_v1';
 const LIVE_CHANNEL_NAME = 'trustedpanel_live_sync_v1';
 
 function readSavedUserToken(): string {
@@ -148,7 +152,29 @@ function saveCachedAdminOrders(orders: OrderItem[]): void {
   }
 }
 
-function broadcastLiveSignal(type: 'new_order' | 'order_updated' | 'order_deleted'): void {
+function readCachedCatalog(): Record<CategoryKey, ServiceItem[]> {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(STORAGE_LIVE_CATALOG_KEY) || 'null');
+    if (parsed && typeof parsed === 'object') {
+      return mergeLiveCatalog(SERVICE_CATALOG, parsed as Record<string, ServiceCatalogOverrideItem[]>);
+    }
+  } catch {
+    // Fallback to default catalog
+  }
+  return mergeLiveCatalog(SERVICE_CATALOG, null);
+}
+
+function readCachedPoster(): string | null {
+  try {
+    return localStorage.getItem(STORAGE_LIVE_POSTER_KEY) || null;
+  } catch {
+    return null;
+  }
+}
+
+function broadcastLiveSignal(
+  type: 'new_order' | 'order_updated' | 'order_deleted' | 'catalog_updated',
+): void {
   try {
     if (typeof BroadcastChannel !== 'undefined') {
       const ch = new BroadcastChannel(LIVE_CHANNEL_NAME);
@@ -169,14 +195,11 @@ function getInitialSupportMessages(): SupportMessage[] {
   }
 }
 
-function findServiceById(cat: CategoryKey, serviceId: string | null): ServiceItem | null {
-  if (!serviceId) return null;
-  return SERVICE_CATALOG[cat]?.find((s) => s.id === serviceId) ?? null;
-}
-
 export default function App() {
   const [uid, setUid] = useState<string>('TRUST-...');
   const [userToken, setUserToken] = useState<string>(readSavedUserToken);
+  const [liveCatalog, setLiveCatalog] = useState<Record<CategoryKey, ServiceItem[]>>(readCachedCatalog);
+  const [livePoster, setLivePoster] = useState<string | null>(readCachedPoster);
   const [orders, setOrders] = useState<OrderItem[]>(readCachedOrders);
   const [notifications, setNotifications] = useState<CustomerNotification[]>(readCachedNotifications);
   const [supportMessages, setSupportMessages] = useState<SupportMessage[]>(
@@ -191,7 +214,10 @@ export default function App() {
     return parsed === 'admin' ? 'menu' : parsed;
   });
   const [currentCategory, setCurrentCategory] = useState<CategoryKey>('instagram');
-  const [currentService, setCurrentService] = useState<ServiceItem | null>(null);
+  const [currentServiceId, setCurrentServiceId] = useState<string | null>(null);
+  const currentService = currentServiceId
+    ? liveCatalog[currentCategory]?.find((s) => s.id === currentServiceId) ?? null
+    : null;
 
   const [supportOpen, setSupportOpen] = useState(false);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
@@ -288,7 +314,7 @@ export default function App() {
         const targetPage: ActivePage =
           st.page === 'admin' && !isAdminLoggedIn ? 'menu' : st.page;
         setCurrentCategory(st.cat || 'instagram');
-        setCurrentService(findServiceById(st.cat || 'instagram', st.serviceId));
+        setCurrentServiceId(st.serviceId || null);
         setActivePage(targetPage);
         setSupportOpen(st.modal === 'support');
         setNotificationsOpen(st.modal === 'notifications');
@@ -315,7 +341,7 @@ export default function App() {
     (next: NavHistoryState, hashOverride?: string) => {
       setActivePage(next.page);
       setCurrentCategory(next.cat);
-      setCurrentService(findServiceById(next.cat, next.serviceId));
+      setCurrentServiceId(next.serviceId || null);
       setSupportOpen(next.modal === 'support');
       setNotificationsOpen(next.modal === 'notifications');
       setAdminLoginOpen(next.modal === 'admin-login');
@@ -459,7 +485,57 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [syncUserState]);
 
-  // Real-time SSE stream for instant Customer Bell notifications
+  // Sync live Admin-edited services, prices & Home poster
+  const syncLiveCatalog = useCallback(async () => {
+    try {
+      const res = await fetch('/api/catalog', {
+        credentials: 'same-origin',
+        cache: 'no-store',
+      });
+      if (!res.ok) return;
+      const data = (await res.json()) as {
+        ok?: boolean;
+        catalog?: Record<string, ServiceCatalogOverrideItem[]>;
+        posterImage?: string | null;
+      };
+      if (!data.ok) return;
+
+      if (data.catalog) {
+        const merged = mergeLiveCatalog(SERVICE_CATALOG, data.catalog);
+        setLiveCatalog(merged);
+        try {
+          localStorage.setItem(STORAGE_LIVE_CATALOG_KEY, JSON.stringify(data.catalog));
+        } catch {
+          // Ignore storage quota errors
+        }
+      }
+      if (data.posterImage !== undefined) {
+        const nextPoster = typeof data.posterImage === 'string' && data.posterImage ? data.posterImage : null;
+        setLivePoster(nextPoster);
+        try {
+          if (nextPoster) {
+            localStorage.setItem(STORAGE_LIVE_POSTER_KEY, nextPoster);
+          } else {
+            localStorage.removeItem(STORAGE_LIVE_POSTER_KEY);
+          }
+        } catch {
+          // Ignore storage quota errors
+        }
+      }
+    } catch {
+      // Ignore transient network errors
+    }
+  }, []);
+
+  useEffect(() => {
+    void syncLiveCatalog();
+    const timer = window.setInterval(() => {
+      void syncLiveCatalog();
+    }, 4000);
+    return () => window.clearInterval(timer);
+  }, [syncLiveCatalog]);
+
+  // Real-time SSE stream for instant Customer Bell notifications & live catalog/poster updates
   useEffect(() => {
     if (typeof EventSource === 'undefined' || !userToken) return;
     const url = `/api/user/events?token=${encodeURIComponent(userToken)}`;
@@ -467,12 +543,17 @@ export default function App() {
     const onNotification = () => {
       void syncUserState(false);
     };
+    const onCatalogUpdate = () => {
+      void syncLiveCatalog();
+    };
     es.addEventListener('notification', onNotification);
+    es.addEventListener('catalog_updated', onCatalogUpdate);
     return () => {
       es.removeEventListener('notification', onNotification);
+      es.removeEventListener('catalog_updated', onCatalogUpdate);
       es.close();
     };
-  }, [syncUserState, userToken]);
+  }, [syncLiveCatalog, syncUserState, userToken]);
 
   // Sync Admin live orders + trigger 3-second iPhone notification immediately when a new order arrives
   const syncAdminOverview = useCallback(
@@ -563,16 +644,20 @@ export default function App() {
       const onLiveChange = () => {
         void syncAdminOverview(false);
       };
+      const onCatalogChange = () => {
+        void syncLiveCatalog();
+      };
       es.addEventListener('new_order', onLiveChange);
       es.addEventListener('order_updated', onLiveChange);
       es.addEventListener('order_deleted', onLiveChange);
+      es.addEventListener('catalog_updated', onCatalogChange);
     }
 
     return () => {
       window.clearInterval(timer);
       if (es) es.close();
     };
-  }, [isAdminLoggedIn, syncAdminOverview]);
+  }, [isAdminLoggedIn, syncAdminOverview, syncLiveCatalog]);
 
   // Cross-tab instant sync via BroadcastChannel (<10ms latency between customer & admin tabs)
   useEffect(() => {
@@ -580,6 +665,10 @@ export default function App() {
     const ch = new BroadcastChannel(LIVE_CHANNEL_NAME);
     ch.onmessage = (event: MessageEvent<{ type?: string }>) => {
       const type = event.data?.type;
+      if (type === 'catalog_updated') {
+        void syncLiveCatalog();
+        return;
+      }
       if (type === 'new_order' || type === 'order_updated' || type === 'order_deleted') {
         if (isAdminLoggedIn) {
           void syncAdminOverview(false);
@@ -590,7 +679,7 @@ export default function App() {
       }
     };
     return () => ch.close();
-  }, [isAdminLoggedIn, syncAdminOverview, syncUserState]);
+  }, [isAdminLoggedIn, syncAdminOverview, syncLiveCatalog, syncUserState]);
 
   // Navigation handlers
   const handleGoHome = useCallback(() => {
@@ -631,14 +720,15 @@ export default function App() {
 
   const handlePosterClick = useCallback(() => {
     playClickSound();
-    const reelsOffer = SERVICE_CATALOG.instagram[1];
+    const reelsOffer =
+      liveCatalog.instagram.find((s) => s.id === 'ig-reels-1rs') ?? liveCatalog.instagram[1];
     pushNavState({
       page: 'prices',
       cat: 'instagram',
       serviceId: reelsOffer.id,
       modal: null,
     });
-  }, [pushNavState]);
+  }, [liveCatalog.instagram, pushNavState]);
 
   const handleGoOrders = useCallback(() => {
     playClickSound();
@@ -1046,6 +1136,166 @@ export default function App() {
     [showToast],
   );
 
+  const handleAdminSendMessage = useCallback(
+    async ({ orderId, message }: { orderId: string; message: string }): Promise<boolean> => {
+      playClickSound();
+      try {
+        const res = await fetch('/api/admin/order-message', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ order_id: orderId, message }),
+        });
+        const data = (await res.json()) as { ok?: boolean; message?: string };
+        if (!res.ok || !data.ok) {
+          showToast(data.message || 'Message send failed ❌', true);
+          return false;
+        }
+        const overrides = readAdminStatusOverrides();
+        if (overrides[orderId]) {
+          overrides[orderId] = { ...overrides[orderId], adminMessage: message };
+          saveAdminStatusOverrides(overrides);
+        }
+        setAdminOrders((prev) => {
+          const next = prev.map((o) =>
+            o.order_id === orderId ? { ...o, adminMessage: message } : o,
+          );
+          saveCachedAdminOrders(next);
+          return next;
+        });
+        showToast('Message Sent to Customer ✅');
+        broadcastLiveSignal('order_updated');
+        await syncAdminOverview(false);
+        await syncUserState(false);
+        return true;
+      } catch {
+        showToast('Network Error ❌', true);
+        return false;
+      }
+    },
+    [showToast, syncAdminOverview, syncUserState],
+  );
+
+  const handleAdminSaveCatalog = useCallback(
+    async (nextCatalog: Record<CategoryKey, ServiceItem[]>): Promise<boolean> => {
+      playClickSound();
+      const payload: Record<string, ServiceCatalogOverrideItem[]> = {};
+      for (const catKey of Object.keys(nextCatalog) as CategoryKey[]) {
+        payload[catKey] = nextCatalog[catKey].map((svc) => ({
+          id: svc.id,
+          name: svc.name,
+          prices: svc.prices,
+        }));
+      }
+      try {
+        const res = await fetch('/api/admin/catalog', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ catalog: payload }),
+        });
+        const data = (await res.json()) as {
+          ok?: boolean;
+          catalog?: Record<string, ServiceCatalogOverrideItem[]>;
+          message?: string;
+        };
+        if (!res.ok || !data.ok) {
+          showToast(data.message || 'Save failed ❌', true);
+          return false;
+        }
+        if (data.catalog) {
+          const merged = mergeLiveCatalog(SERVICE_CATALOG, data.catalog);
+          setLiveCatalog(merged);
+          try {
+            localStorage.setItem(STORAGE_LIVE_CATALOG_KEY, JSON.stringify(data.catalog));
+          } catch {
+            // Ignore storage errors
+          }
+        }
+        broadcastLiveSignal('catalog_updated');
+        showToast('Prices & Service Live Updated ✅');
+        return true;
+      } catch {
+        showToast('Network Error ❌', true);
+        return false;
+      }
+    },
+    [showToast],
+  );
+
+  const handleAdminResetCatalog = useCallback(async (): Promise<boolean> => {
+    playClickSound();
+    try {
+      const res = await fetch('/api/admin/catalog', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reset: true }),
+      });
+      const data = (await res.json()) as {
+        ok?: boolean;
+        catalog?: Record<string, ServiceCatalogOverrideItem[]>;
+      };
+      if (!res.ok || !data.ok) {
+        showToast('Reset failed ❌', true);
+        return false;
+      }
+      setLiveCatalog(mergeLiveCatalog(SERVICE_CATALOG, data.catalog ?? null));
+      try {
+        localStorage.removeItem(STORAGE_LIVE_CATALOG_KEY);
+      } catch {
+        // Ignore storage errors
+      }
+      broadcastLiveSignal('catalog_updated');
+      showToast('All Services Reset to Default ✅');
+      return true;
+    } catch {
+      showToast('Network Error ❌', true);
+      return false;
+    }
+  }, [showToast]);
+
+  const handleAdminSavePoster = useCallback(
+    async (posterDataUrl: string | null): Promise<boolean> => {
+      playClickSound();
+      try {
+        const res = await fetch('/api/admin/poster', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(posterDataUrl ? { posterImage: posterDataUrl } : { reset: true }),
+        });
+        const data = (await res.json()) as {
+          ok?: boolean;
+          posterImage?: string | null;
+          message?: string;
+        };
+        if (!res.ok || !data.ok) {
+          showToast(data.message || 'Poster update failed ❌', true);
+          return false;
+        }
+        const nextPoster = typeof data.posterImage === 'string' ? data.posterImage : null;
+        setLivePoster(nextPoster);
+        try {
+          if (nextPoster) {
+            localStorage.setItem(STORAGE_LIVE_POSTER_KEY, nextPoster);
+          } else {
+            localStorage.removeItem(STORAGE_LIVE_POSTER_KEY);
+          }
+        } catch {
+          // Ignore storage errors
+        }
+        broadcastLiveSignal('catalog_updated');
+        showToast(nextPoster ? 'Home Poster Live Updated ✅' : 'Default Poster Restored ✅');
+        return true;
+      } catch {
+        showToast('Network Error ❌', true);
+        return false;
+      }
+    },
+    [showToast],
+  );
+
   const handleCopyUid = useCallback(() => {
     playClickSound();
     navigator.clipboard?.writeText(uid).catch(() => {});
@@ -1107,6 +1357,7 @@ export default function App() {
       <main className="max-w-[460px] mx-auto px-[14px]">
         {activePage === 'home' && (
           <HomeView
+            posterImage={livePoster}
             onSelectCategory={handleSelectCategory}
             onPosterClick={handlePosterClick}
           />
@@ -1115,7 +1366,7 @@ export default function App() {
         {activePage === 'services' && (
           <ServicesView
             categoryTitle={currentCatMeta.title}
-            services={SERVICE_CATALOG[currentCategory]}
+            services={liveCatalog[currentCategory]}
             onBack={() => goBackOneStep('home')}
             onSelectService={handleSelectService}
           />
@@ -1159,10 +1410,17 @@ export default function App() {
         {activePage === 'admin' && isAdminLoggedIn && (
           <AdminView
             orders={adminOrders}
+            catalog={liveCatalog}
+            posterImage={livePoster}
             onBack={() => goBackOneStep('menu')}
             onLogout={handleAdminLogout}
             onOrderStatusChange={handleAdminOrderStatus}
+            onSendOrderMessage={handleAdminSendMessage}
             onDeleteOrder={handleAdminDeleteOrder}
+            onSaveCatalog={handleAdminSaveCatalog}
+            onResetCatalog={handleAdminResetCatalog}
+            onSavePoster={handleAdminSavePoster}
+            onShowToast={showToast}
             onTestSound={() => {
               unlockAudioContext();
               playIphoneNotification3Sec();

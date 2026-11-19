@@ -143,14 +143,17 @@ export function PricesView({
           const canvas = qrCanvasRef.current;
           if (!canvas) return;
 
-          // Crop QR square cleanly so bottom UPI ID caption is never rendered
-          const cropHeight = Math.floor(img.naturalHeight * 0.835);
+          // Render full dynamic UPI QR code (with auto-set amount) cleanly without cropping finder patterns
+          const isStaticFallbackJpg = blob.type === 'image/jpeg';
+          const cropHeight = isStaticFallbackJpg
+            ? Math.floor(img.naturalHeight * 0.835)
+            : img.naturalHeight;
           const cropWidth = img.naturalWidth;
           canvas.width = cropWidth;
           canvas.height = cropHeight;
           const ctx = canvas.getContext('2d');
           if (ctx) {
-            ctx.fillStyle = '#000000';
+            ctx.fillStyle = isStaticFallbackJpg ? '#000000' : '#FFFFFF';
             ctx.fillRect(0, 0, cropWidth, cropHeight);
             ctx.drawImage(img, 0, 0, cropWidth, cropHeight, 0, 0, cropWidth, cropHeight);
           }
@@ -364,23 +367,23 @@ export function PricesView({
               </div>
 
               <div className="my-2 flex items-center justify-center">
-                <div className="relative w-48 h-48 rounded-[16px] bg-black p-2 shadow-sm flex items-center justify-center overflow-hidden">
+                <div className="relative w-48 h-48 rounded-[16px] bg-white border-2 border-[#e9dffc] p-2 shadow-sm flex items-center justify-center overflow-hidden">
                   <canvas
                     ref={qrCanvasRef}
-                    aria-label="Protected UPI QR Code"
+                    aria-label="Protected Dynamic UPI QR Code"
                     draggable={false}
-                    className={`w-full h-full object-contain rounded-[10px] pointer-events-none ${
+                    className={`w-full h-full object-contain rounded-[8px] pointer-events-none ${
                       qrLoading || qrError ? 'opacity-0' : 'opacity-100'
                     }`}
                   />
                   {qrLoading && (
-                    <div className="absolute inset-0 flex flex-col items-center justify-center text-white text-xs gap-1.5">
+                    <div className="absolute inset-0 bg-[#1a1033]/90 flex flex-col items-center justify-center text-white text-xs gap-1.5">
                       <Loader2 className="w-6 h-6 animate-spin text-[#ffeb3b]" />
                       <span>Loading Scanner...</span>
                     </div>
                   )}
                   {qrError && (
-                    <div className="absolute inset-0 flex flex-col items-center justify-center text-white text-xs p-3">
+                    <div className="absolute inset-0 bg-[#1a1033]/95 flex flex-col items-center justify-center text-white text-xs p-3">
                       <span className="text-[#ffeb3b] font-bold">Scanner Unavailable</span>
                       <span className="mt-1 opacity-80">Close & tap Place Order again</span>
                     </div>
@@ -389,7 +392,7 @@ export function PricesView({
               </div>
 
               <div className="text-[11px] font-semibold text-[#555]">
-                Scan QR with PhonePe / GPay / Paytm / BHIM
+                Scan QR with PhonePe / GPay / Paytm / BHIM (₹{checkoutState.amount} Auto-Set)
               </div>
             </div>
 

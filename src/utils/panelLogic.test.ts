@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { SERVICE_CATALOG } from '../data/services';
 import {
   countUnreadNotifications,
   detectNewOrderIds,
@@ -7,7 +8,9 @@ import {
   generateUserId,
   getOrderStatusBadgeStyle,
   mergeAdminOrders,
+  mergeLiveCatalog,
   parseHashPage,
+  validateCatalogServiceEdit,
   validateDirectOrderInput,
   validatePaymentScreenshot,
   validatePlatformLink,
@@ -314,4 +317,34 @@ test('parseHashPage routes valid top-level hashes and defaults #fund to home', (
   assert.equal(parseHashPage('#fund'), 'home');
   assert.equal(parseHashPage('#home'), 'home');
   assert.equal(parseHashPage(''), 'home');
+});
+
+test('mergeLiveCatalog applies Admin live price & name overrides while preserving icons and metadata', () => {
+  const merged = mergeLiveCatalog(SERVICE_CATALOG, {
+    instagram: [
+      {
+        id: 'ig-reels-1rs',
+        name: '7rs = 1k Reels Views',
+        prices: [
+          { q: '1K Reels Views', p: 7 },
+          { q: '5K Reels Views', p: 25 },
+        ],
+      },
+    ],
+  });
+  const reels = merged.instagram.find((s) => s.id === 'ig-reels-1rs');
+  assert.ok(reels);
+  assert.equal(reels.name, '7rs = 1k Reels Views');
+  assert.equal(reels.icon, 'instagram');
+  assert.equal(reels.prices.length, 2);
+  assert.equal(reels.prices[0].p, 7);
+});
+
+test('validateCatalogServiceEdit enforces non-empty name and valid positive prices', () => {
+  assert.equal(validateCatalogServiceEdit({ name: '   ', prices: [{ q: '1K', p: 5 }] }).ok, false);
+  assert.equal(validateCatalogServiceEdit({ name: 'Reels', prices: [{ q: '1K', p: 0 }] }).ok, false);
+  assert.deepEqual(
+    validateCatalogServiceEdit({ name: ' 5rs Reels ', prices: [{ q: ' 1K Views ', p: 5 }] }),
+    { ok: true, name: '5rs Reels', prices: [{ q: '1K Views', p: 5 }] },
+  );
 });

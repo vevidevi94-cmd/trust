@@ -1,14 +1,20 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { CATEGORIES, POSTER_IMAGE_PATH, type CategoryKey } from '../data/services';
 import { PlatformIcon } from './BrandIcons';
 
 interface HomeViewProps {
+  posterImage?: string | null;
   onSelectCategory: (cat: CategoryKey) => void;
   onPosterClick: () => void;
 }
 
-export function HomeView({ onSelectCategory, onPosterClick }: HomeViewProps) {
+export function HomeView({ posterImage, onSelectCategory, onPosterClick }: HomeViewProps) {
   const [posterError, setPosterError] = useState(false);
+  const resolvedPoster = posterImage || POSTER_IMAGE_PATH;
+
+  useEffect(() => {
+    setPosterError(false);
+  }, [resolvedPoster]);
 
   return (
     <section aria-labelledby="our-services-heading">
@@ -46,7 +52,7 @@ export function HomeView({ onSelectCategory, onPosterClick }: HomeViewProps) {
       >
         {!posterError ? (
           <img
-            src={POSTER_IMAGE_PATH}
+            src={resolvedPoster}
             alt="Insta Views Offer"
             referrerPolicy="no-referrer"
             onError={() => setPosterError(true)}
