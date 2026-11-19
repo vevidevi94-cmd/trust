@@ -45,6 +45,27 @@ export function detectNewOrderIds(
     .map((order) => order.order_id);
 }
 
+export function mergeAdminOrders(params: {
+  serverOrders: OrderItem[];
+  cachedOrders: OrderItem[];
+  deletedIds: Set<string>;
+}): OrderItem[] {
+  const byId = new Map<string, OrderItem>();
+  for (const order of params.serverOrders) {
+    if (!params.deletedIds.has(order.order_id)) {
+      byId.set(order.order_id, order);
+    }
+  }
+  for (const cached of params.cachedOrders) {
+    if (!params.deletedIds.has(cached.order_id) && !byId.has(cached.order_id)) {
+      byId.set(cached.order_id, cached);
+    }
+  }
+  return Array.from(byId.values()).sort(
+    (a, b) => (b.createdAt || 0) - (a.createdAt || 0) || b.id - a.id,
+  );
+}
+
 export function countUnreadNotifications(notifications: CustomerNotification[]): number {
   return notifications.filter((n) => !n.read).length;
 }

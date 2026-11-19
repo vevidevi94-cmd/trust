@@ -535,8 +535,9 @@ function getVerifiedUserSession(req: Request): { uid: string; sid: string; token
   const cookies = parseCookies(req);
   const cookieToken = cookies[USER_COOKIE];
   const headerToken = typeof req.headers['x-user-token'] === 'string' ? req.headers['x-user-token'] : '';
+  const queryToken = typeof req.query?.token === 'string' ? req.query.token : '';
 
-  for (const candidate of [cookieToken, headerToken]) {
+  for (const candidate of [cookieToken, headerToken, queryToken]) {
     if (!candidate) continue;
     const verified = verifyToken<{ uid?: string; sid?: string }>(candidate);
     if (verified?.uid && verified?.sid && /^TRUST-\d{4}$/.test(verified.uid)) {
@@ -639,6 +640,30 @@ export function createApiApp() {
   const store = loadStore();
   const usedQrTokens = new Map<string, number>();
   const loginFailures = new Map<string, { count: number; resetAt: number }>();
+  const adminSseClients = new Set<Response>();
+  const userSseClients = new Map<string, Set<Response>>();
+
+  function sendSse(res: Response, event: string, data: unknown): void {
+    try {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    } catch {
+      // Ignore write failures on closing sockets
+    }
+  }
+
+  function broadcastToAdmins(event: string, data: unknown): void {
+    for (const client of adminSseClients) {
+      sendSse(client, event, data);
+    }
+  }
+
+  function broadcastToUser(uid: string, event: string, data: unknown): void {
+    const clients = userSseClients.get(uid);
+    if (!clients) return;
+    for (const client of clients) {
+      sendSse(client, event, data);
+    }
+  }
 
   function pruneTokens() {
     const now = Date.now();
@@ -649,6 +674,75 @@ export function createApiApp() {
       if (rec.resetAt < now) loginFailures.delete(ip);
     }
   }
+
+  // Real-time Server-Sent Events stream for Customer Bell notifications
+  app.get('/api/user/events', (req, res) => {
+    const session = getVerifiedUserSession(req);
+    if (!session) {
+      res.status(401).end();
+      return;
+    }
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+
+    let clients = userSseClients.get(session.uid);
+    if (!clients) {
+      clients = new Set<Response>();
+      userSseClients.set(session.uid, clients);
+    }
+    clients.add(res);
+    sendSse(res, 'connected', { ok: true, uid: session.uid });
+
+    const heartbeat = setInterval(() => {
+      try {
+        res.write(': ping\n\n');
+      } catch {
+        clearInterval(heartbeat);
+      }
+    }, 20_000);
+
+    req.on('close', () => {
+      clearInterval(heartbeat);
+      clients?.delete(res);
+      if (clients && clients.size === 0) {
+        userSseClients.delete(session.uid);
+      }
+    });
+  });
+
+  // Real-time Server-Sent Events stream for Admin live orders
+  app.get('/api/admin/events', (req, res) => {
+    if (!isAdminAuthenticated(req)) {
+      res.status(401).end();
+      return;
+    }
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+
+    adminSseClients.add(res);
+    sendSse(res, 'connected', { ok: true });
+
+    const heartbeat = setInterval(() => {
+      try {
+        res.write(': ping\n\n');
+      } catch {
+        clearInterval(heartbeat);
+      }
+    }, 20_000);
+
+    req.on('close', () => {
+      clearInterval(heartbeat);
+      adminSseClients.delete(res);
+    });
+  });
 
   // Customer's own persistent state (orders + live notifications from admin)
   app.get('/api/user-state', (req, res) => {
@@ -854,6 +948,12 @@ export function createApiApp() {
 
     store.orders.unshift(savedOrder);
     saveStore(store);
+    broadcastToAdmins('new_order', {
+      order_id: savedOrder.order_id,
+      id: savedOrder.id,
+      service: savedOrder.service,
+      price: savedOrder.price,
+    });
     void syncToFirebase(`orders/${savedOrder.order_id}`, {
       id: savedOrder.id,
       order_id: savedOrder.order_id,
@@ -993,6 +1093,17 @@ export function createApiApp() {
     store.notifications.unshift(notif);
     saveStore(store);
 
+    broadcastToAdmins('order_updated', {
+      order_id: target.order_id,
+      status: target.status,
+    });
+    broadcastToUser(target.uid, 'notification', {
+      id: notif.id,
+      orderId: target.order_id,
+      status: target.status,
+      message: notif.message,
+    });
+
     void syncToFirebase(`orders/${target.order_id}`, {
       order_id: target.order_id,
       status: target.status,
@@ -1003,7 +1114,7 @@ export function createApiApp() {
     res.json({ ok: true, order: target, notification: notif });
   });
 
-  // Admin explicitly deletes an order notification from Admin Panel
+  // Admin explicitly deletes an order notification from Admin Panel (idempotent)
   app.delete('/api/admin/orders/:orderId', (req, res) => {
     if (!isAdminAuthenticated(req)) {
       res.status(401).json({ ok: false, message: 'Unauthorized' });
@@ -1012,13 +1123,12 @@ export function createApiApp() {
 
     const orderId = String(req.params.orderId || '').trim();
     const target = store.orders.find((o) => o.order_id === orderId);
-    if (!target) {
-      res.status(404).json({ ok: false, message: 'Order not found' });
-      return;
+    if (target) {
+      target.hiddenFromAdmin = true;
+      saveStore(store);
     }
 
-    target.hiddenFromAdmin = true;
-    saveStore(store);
+    broadcastToAdmins('order_deleted', { order_id: orderId });
     res.json({ ok: true, order_id: orderId });
   });
 

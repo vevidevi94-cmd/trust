@@ -12,6 +12,7 @@ import {
 import {
   countUnreadNotifications,
   detectNewOrderIds,
+  mergeAdminOrders,
   parseHashPage,
   validateDirectOrderInput,
   type ActivePage,
@@ -45,6 +46,9 @@ interface NavHistoryState {
 const STORAGE_USER_TOKEN_KEY = 'tp_user_session_v2';
 const STORAGE_ORDERS_CACHE_KEY = 'tp_orders_cache_v2';
 const STORAGE_NOTIFS_CACHE_KEY = 'tp_notifs_cache_v2';
+const STORAGE_ADMIN_ORDERS_CACHE_KEY = 'tp_admin_orders_cache_v2';
+const STORAGE_ADMIN_DELETED_IDS_KEY = 'tp_admin_deleted_ids_v2';
+const LIVE_CHANNEL_NAME = 'trustedpanel_live_sync_v1';
 
 function readSavedUserToken(): string {
   try {
@@ -69,6 +73,69 @@ function readCachedNotifications(): CustomerNotification[] {
     return Array.isArray(parsed) ? parsed : [];
   } catch {
     return [];
+  }
+}
+
+function readCachedAdminOrders(): OrderItem[] {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(STORAGE_ADMIN_ORDERS_CACHE_KEY) || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function readAdminDeletedIds(): string[] {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(STORAGE_ADMIN_DELETED_IDS_KEY) || '[]');
+    return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveAdminDeletedIds(ids: string[]): void {
+  try {
+    localStorage.setItem(STORAGE_ADMIN_DELETED_IDS_KEY, JSON.stringify(ids));
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+function saveCachedAdminOrders(orders: OrderItem[]): void {
+  try {
+    localStorage.setItem(STORAGE_ADMIN_ORDERS_CACHE_KEY, JSON.stringify(orders));
+    return;
+  } catch {
+    // If large base64 screenshots exceed localStorage quota, keep ALL order records
+    // and only drop oldest screenshots so no order is ever lost
+  }
+  try {
+    const compact = orders.map((o, idx) =>
+      idx < 10 ? o : { ...o, paymentScreenshot: undefined },
+    );
+    localStorage.setItem(STORAGE_ADMIN_ORDERS_CACHE_KEY, JSON.stringify(compact));
+    return;
+  } catch {
+    // Fallback: strip screenshots while preserving every single order record permanently
+  }
+  try {
+    const minimal = orders.map((o) => ({ ...o, paymentScreenshot: undefined }));
+    localStorage.setItem(STORAGE_ADMIN_ORDERS_CACHE_KEY, JSON.stringify(minimal));
+  } catch {
+    // Ignore final storage failure
+  }
+}
+
+function broadcastLiveSignal(type: 'new_order' | 'order_updated' | 'order_deleted'): void {
+  try {
+    if (typeof BroadcastChannel !== 'undefined') {
+      const ch = new BroadcastChannel(LIVE_CHANNEL_NAME);
+      ch.postMessage({ type, ts: Date.now() });
+      ch.close();
+    }
+  } catch {
+    // Ignore unsupported environments
   }
 }
 
@@ -125,6 +192,7 @@ export default function App() {
   const knownAdminOrderIdsRef = useRef<Set<string> | null>(null);
   const knownCustomerNotifIdsRef = useRef<Set<string> | null>(null);
   const historyDepthRef = useRef<number>(0);
+  const initialHashPageRef = useRef<ActivePage>(parseHashPage(window.location.hash));
 
   const showToast = useCallback((message: string, isError = false) => {
     if (toastTimerRef.current !== null) {
@@ -154,8 +222,17 @@ export default function App() {
       .then((data: { ok?: boolean; authenticated?: boolean } | null) => {
         if (data?.ok && data.authenticated) {
           setIsAdminLoggedIn(true);
-          if (parseHashPage(window.location.hash) === 'admin') {
+          if (initialHashPageRef.current === 'admin') {
             setActivePage('admin');
+            try {
+              window.history.replaceState(
+                { page: 'admin', cat: 'instagram', serviceId: null, modal: null },
+                '',
+                '#admin',
+              );
+            } catch {
+              // Ignore history errors
+            }
           }
         }
       })
@@ -164,7 +241,7 @@ export default function App() {
 
   // Initialize history state cleanly on mount so phone Back moves exactly 1 step per press
   useEffect(() => {
-    const initialPage = parseHashPage(window.location.hash);
+    const initialPage = initialHashPageRef.current;
     const resolvedPage: ActivePage = initialPage === 'admin' ? 'menu' : initialPage;
     const initialState: NavHistoryState = {
       page: resolvedPage,
@@ -356,9 +433,24 @@ export default function App() {
     void syncUserState(true);
     const timer = window.setInterval(() => {
       void syncUserState(false);
-    }, 2500);
+    }, 1200);
     return () => window.clearInterval(timer);
   }, [syncUserState]);
+
+  // Real-time SSE stream for instant Customer Bell notifications
+  useEffect(() => {
+    if (typeof EventSource === 'undefined' || !userToken) return;
+    const url = `/api/user/events?token=${encodeURIComponent(userToken)}`;
+    const es = new EventSource(url);
+    const onNotification = () => {
+      void syncUserState(false);
+    };
+    es.addEventListener('notification', onNotification);
+    return () => {
+      es.removeEventListener('notification', onNotification);
+      es.close();
+    };
+  }, [syncUserState, userToken]);
 
   // Sync Admin live orders + trigger 3-second iPhone notification immediately when a new order arrives
   const syncAdminOverview = useCallback(
@@ -381,16 +473,22 @@ export default function App() {
         if (!data.ok) return;
 
         const incomingOrders = Array.isArray(data.orders) ? data.orders : [];
+        const deletedIds = new Set(readAdminDeletedIds());
+        const merged = mergeAdminOrders({
+          serverOrders: incomingOrders,
+          cachedOrders: readCachedAdminOrders(),
+          deletedIds,
+        });
 
         if (knownAdminOrderIdsRef.current === null || isInitialPoll) {
-          knownAdminOrderIdsRef.current = new Set(incomingOrders.map((o) => o.order_id));
+          knownAdminOrderIdsRef.current = new Set(merged.map((o) => o.order_id));
         } else {
-          const newIds = detectNewOrderIds(knownAdminOrderIdsRef.current, incomingOrders);
+          const newIds = detectNewOrderIds(knownAdminOrderIdsRef.current, merged);
           if (newIds.length > 0) {
             for (const id of newIds) {
               knownAdminOrderIdsRef.current.add(id);
             }
-            const newest = incomingOrders.find((o) => o.order_id === newIds[0]);
+            const newest = merged.find((o) => o.order_id === newIds[0]);
             playIphoneNotification3Sec();
             showToast(
               newest
@@ -400,25 +498,72 @@ export default function App() {
           }
         }
 
-        setAdminOrders(incomingOrders);
+        saveCachedAdminOrders(merged);
+        setAdminOrders(merged);
       } catch {
-        // Ignore transient poll errors
+        // Keep cached orders visible during transient network hiccups
       }
     },
     [isAdminLoggedIn, showToast],
   );
 
+  // Instant Admin hydration, SSE live push, and fast 1s fallback polling
   useEffect(() => {
     if (!isAdminLoggedIn) {
       knownAdminOrderIdsRef.current = null;
       return;
     }
+
+    // Immediately show permanently saved Admin orders before network response completes
+    const deletedIds = new Set(readAdminDeletedIds());
+    const initialCached = mergeAdminOrders({
+      serverOrders: [],
+      cachedOrders: readCachedAdminOrders(),
+      deletedIds,
+    });
+    if (initialCached.length > 0) {
+      setAdminOrders(initialCached);
+    }
+
     void syncAdminOverview(true);
     const timer = window.setInterval(() => {
       void syncAdminOverview(false);
-    }, 2000);
-    return () => window.clearInterval(timer);
+    }, 1000);
+
+    let es: EventSource | null = null;
+    if (typeof EventSource !== 'undefined') {
+      es = new EventSource('/api/admin/events');
+      const onLiveChange = () => {
+        void syncAdminOverview(false);
+      };
+      es.addEventListener('new_order', onLiveChange);
+      es.addEventListener('order_updated', onLiveChange);
+      es.addEventListener('order_deleted', onLiveChange);
+    }
+
+    return () => {
+      window.clearInterval(timer);
+      if (es) es.close();
+    };
   }, [isAdminLoggedIn, syncAdminOverview]);
+
+  // Cross-tab instant sync via BroadcastChannel (<10ms latency between customer & admin tabs)
+  useEffect(() => {
+    if (typeof BroadcastChannel === 'undefined') return;
+    const ch = new BroadcastChannel(LIVE_CHANNEL_NAME);
+    ch.onmessage = (event: MessageEvent<{ type?: string }>) => {
+      const type = event.data?.type;
+      if (type === 'new_order' || type === 'order_updated' || type === 'order_deleted') {
+        if (isAdminLoggedIn) {
+          void syncAdminOverview(false);
+        }
+        if (type === 'order_updated') {
+          void syncUserState(false);
+        }
+      }
+    };
+    return () => ch.close();
+  }, [isAdminLoggedIn, syncAdminOverview, syncUserState]);
 
   // Navigation handlers
   const handleGoHome = useCallback(() => {
@@ -665,6 +810,7 @@ export default function App() {
         setOrders((prev) => [data.order!, ...prev]);
         setCheckoutState(null);
         setProcessingOrder(data.order);
+        broadcastLiveSignal('new_order');
         return true;
       } catch {
         showToast('Network Error ❌ Try Again', true);
@@ -797,10 +943,22 @@ export default function App() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ order_id: orderId, status, note }),
         });
-        if (!res.ok) {
+        if (!res.ok && res.status !== 404) {
           showToast('Failed to update order status ❌', true);
           return;
         }
+
+        // Optimistically persist the selected status & tick immediately
+        setAdminOrders((prev) => {
+          const next = prev.map((o) =>
+            o.order_id === orderId
+              ? { ...o, status, adminMessage: note || o.adminMessage }
+              : o,
+          );
+          saveCachedAdminOrders(next);
+          return next;
+        });
+
         const label =
           status === 'successful'
             ? 'Order Marked Successful ✅'
@@ -808,6 +966,7 @@ export default function App() {
               ? 'Order Marked Payment Failed ❌'
               : 'Order Marked Pending ⏳';
         showToast(label, status === 'payment_failed');
+        broadcastLiveSignal('order_updated');
         await syncAdminOverview(false);
         await syncUserState(false);
       } catch {
@@ -829,7 +988,14 @@ export default function App() {
           showToast('Delete failed ❌', true);
           return;
         }
-        setAdminOrders((prev) => prev.filter((o) => o.order_id !== orderId));
+        const nextDeleted = Array.from(new Set([...readAdminDeletedIds(), orderId]));
+        saveAdminDeletedIds(nextDeleted);
+        setAdminOrders((prev) => {
+          const next = prev.filter((o) => o.order_id !== orderId);
+          saveCachedAdminOrders(next);
+          return next;
+        });
+        broadcastLiveSignal('order_deleted');
         showToast('Order Notification Deleted 🗑️');
       } catch {
         showToast('Network Error ❌', true);

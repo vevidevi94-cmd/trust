@@ -121,6 +121,10 @@ export function AdminView({
             const badge = getOrderStatusBadgeStyle(order.status);
             const isBusy = busyId === order.order_id;
             const isCopied = copiedId === order.order_id;
+            const currentStatus = order.status.toLowerCase();
+            const isSuccessful = currentStatus === 'successful' || currentStatus === 'completed';
+            const isPending = currentStatus === 'pending';
+            const isFailed = currentStatus === 'payment_failed' || currentStatus === 'failed';
             return (
               <div
                 key={order.order_id}
@@ -222,28 +226,55 @@ export function AdminView({
                     <button
                       type="button"
                       disabled={isBusy}
+                      aria-pressed={isSuccessful}
                       onClick={() => handleStatusClick(order.order_id, 'successful')}
-                      className="bg-[#2e7d32] text-white py-2 px-1.5 rounded-[10px] text-[11px] font-extrabold inline-flex items-center justify-center gap-1 cursor-pointer disabled:opacity-60 active:scale-[0.98] whitespace-nowrap"
+                      className={`py-2 px-1.5 rounded-[10px] text-[11px] font-extrabold inline-flex items-center justify-center gap-1 cursor-pointer disabled:opacity-60 active:scale-[0.98] whitespace-nowrap transition-transform ${
+                        isSuccessful
+                          ? 'bg-[#2e7d32] text-white ring-2 ring-[#1b5e20] ring-offset-1 shadow-md'
+                          : 'bg-[#e8f5e9] text-[#2e7d32] border border-[#a5d6a7] hover:bg-[#c8e6c9]'
+                      }`}
                     >
-                      <CheckCircle2 className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                      {isSuccessful ? (
+                        <Check className="w-3.5 h-3.5 shrink-0 stroke-[3.2]" aria-hidden="true" />
+                      ) : (
+                        <CheckCircle2 className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                      )}
                       <span>Successful</span>
                     </button>
                     <button
                       type="button"
                       disabled={isBusy}
+                      aria-pressed={isPending}
                       onClick={() => handleStatusClick(order.order_id, 'pending')}
-                      className="bg-[#f59e0b] text-white py-2 px-1.5 rounded-[10px] text-[11px] font-extrabold inline-flex items-center justify-center gap-1 cursor-pointer disabled:opacity-60 active:scale-[0.98] whitespace-nowrap"
+                      className={`py-2 px-1.5 rounded-[10px] text-[11px] font-extrabold inline-flex items-center justify-center gap-1 cursor-pointer disabled:opacity-60 active:scale-[0.98] whitespace-nowrap transition-transform ${
+                        isPending
+                          ? 'bg-[#f59e0b] text-white ring-2 ring-[#b45309] ring-offset-1 shadow-md'
+                          : 'bg-[#fff8e1] text-[#b45309] border border-[#ffe082] hover:bg-[#ffecb3]'
+                      }`}
                     >
-                      <Clock className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                      {isPending ? (
+                        <Check className="w-3.5 h-3.5 shrink-0 stroke-[3.2]" aria-hidden="true" />
+                      ) : (
+                        <Clock className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                      )}
                       <span>Pending</span>
                     </button>
                     <button
                       type="button"
                       disabled={isBusy}
+                      aria-pressed={isFailed}
                       onClick={() => handleStatusClick(order.order_id, 'payment_failed')}
-                      className="bg-[#c62828] text-white py-2 px-1.5 rounded-[10px] text-[11px] font-extrabold inline-flex items-center justify-center gap-1 cursor-pointer disabled:opacity-60 active:scale-[0.98] whitespace-nowrap"
+                      className={`py-2 px-1.5 rounded-[10px] text-[11px] font-extrabold inline-flex items-center justify-center gap-1 cursor-pointer disabled:opacity-60 active:scale-[0.98] whitespace-nowrap transition-transform ${
+                        isFailed
+                          ? 'bg-[#c62828] text-white ring-2 ring-[#7f1d1d] ring-offset-1 shadow-md'
+                          : 'bg-[#ffebee] text-[#c62828] border border-[#ef9a9a] hover:bg-[#ffcdd2]'
+                      }`}
                     >
-                      <XCircle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                      {isFailed ? (
+                        <Check className="w-3.5 h-3.5 shrink-0 stroke-[3.2]" aria-hidden="true" />
+                      ) : (
+                        <XCircle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                      )}
                       <span>Pay Failed</span>
                     </button>
                   </div>

@@ -6,11 +6,50 @@ import {
   formatIndianDateTime,
   generateUserId,
   getOrderStatusBadgeStyle,
+  mergeAdminOrders,
   parseHashPage,
   validateDirectOrderInput,
   validatePaymentScreenshot,
   validatePlatformLink,
 } from './panelLogic';
+
+test('mergeAdminOrders keeps all non-deleted orders permanently across server resets', () => {
+  const cached = [
+    {
+      id: 1,
+      order_id: 'ORD1',
+      service: '1rs = 1k Reels Views',
+      pack: '1K Reels Views',
+      price: 1,
+      amount: 1,
+      link: 'https://instagram.com/reel/a',
+      status: 'successful',
+      date: 'd',
+      createdAt: 100,
+      uid: 'TRUST-1111',
+    },
+    {
+      id: 2,
+      order_id: 'ORD2',
+      service: 'FB FOLLOWERS',
+      pack: '1K Followers',
+      price: 30,
+      amount: 30,
+      link: 'https://facebook.com/demo',
+      status: 'payment_failed',
+      date: 'd',
+      createdAt: 200,
+      uid: 'TRUST-2222',
+    },
+  ];
+  const merged = mergeAdminOrders({
+    serverOrders: [],
+    cachedOrders: cached,
+    deletedIds: new Set(['ORD2']),
+  });
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0].order_id, 'ORD1');
+});
 
 test('formatIndianDateTime formats UTC timestamp in Asia/Kolkata IST', () => {
   const utcMs = Date.UTC(2026, 10, 18, 14, 12, 51);
