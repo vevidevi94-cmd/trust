@@ -60,7 +60,7 @@ export function OrdersView({ orders }: OrdersViewProps) {
                     Admin Message: {order.adminMessage}
                   </div>
                 )}
-                <div className="text-[11px] text-[#666666] mt-0.5 tabular-nums">
+                <div className="text-[11px] text-[#666666] mt-0.5 tabular-nums break-all">
                   {order.createdAt ? formatIndianDateTime(order.createdAt) : order.date} | {order.order_id}
                 </div>
               </div>

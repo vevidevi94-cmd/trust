@@ -1,0 +1,217 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 1: Global Safety Net — default deny everything not explicitly permitted
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidOrderId(id) {
+      return id is string && id.size() >= 18 && id.size() <= 64 && id.matches('^ORD[0-9]{10,16}_[a-zA-Z0-9]{8,32}$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isAdmin() {
+      return isVerifiedUser() && (
+        request.auth.token.email == 'vevidevi94@gmail.com' ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    function isValidAlertList(alerts) {
+      return alerts is list
+        && alerts.size() <= 25
+        && (
+          alerts.size() == 0
+          || (
+            alerts[0] is map
+            && alerts[0].keys().hasAll(['id', 'status', 'message', 'date', 'createdAt'])
+            && alerts[0].keys().hasOnly(['id', 'status', 'message', 'date', 'createdAt'])
+            && alerts[0].id is string && alerts[0].id.size() >= 1 && alerts[0].id.size() <= 80
+            && alerts[0].status in ['pending', 'successful', 'payment_failed']
+            && alerts[0].message is string && alerts[0].message.size() <= 500
+            && alerts[0].date is string && alerts[0].date.size() <= 64
+            && alerts[0].createdAt is number
+          )
+        );
+    }
+
+    function isValidOrder(data, orderId) {
+      return data.keys().hasAll([
+          'id', 'order_id', 'uid', 'service', 'pack', 'price', 'amount', 'link',
+          'status', 'adminMessage', 'date', 'createdAt', 'statusUpdatedAt',
+          'messageUpdatedAt', 'hasPaymentScreenshot', 'hiddenFromAdmin',
+          'recentAlerts', 'serverCreatedAt', 'serverUpdatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'order_id', 'uid', 'service', 'pack', 'price', 'amount', 'link',
+          'status', 'adminMessage', 'date', 'createdAt', 'statusUpdatedAt',
+          'messageUpdatedAt', 'hasPaymentScreenshot', 'hiddenFromAdmin',
+          'recentAlerts', 'serverCreatedAt', 'serverUpdatedAt'
+        ])
+        && data.id is int && data.id >= 1 && data.id <= 100000000
+        && data.order_id is string && data.order_id == orderId && isValidOrderId(data.order_id)
+        && data.uid is string && data.uid.size() >= 10 && data.uid.size() <= 16 && data.uid.matches('^TRUST-[0-9]{4}$')
+        && data['service'] is string && data['service'].size() >= 1 && data['service'].size() <= 120
+        && data.pack is string && data.pack.size() >= 1 && data.pack.size() <= 120
+        && data.price is number && data.price > 0 && data.price <= 100000
+        && data.amount is number && data.amount > 0 && data.amount <= 100000
+        && data.link is string && data.link.size() >= 5 && data.link.size() <= 500
+        && data.status is string && data.status in ['pending', 'successful', 'payment_failed']
+        && data.adminMessage is string && data.adminMessage.size() <= 500
+        && data.date is string && data.date.size() >= 4 && data.date.size() <= 64
+        && data.createdAt is number && data.createdAt > 0
+        && data.statusUpdatedAt is number && data.statusUpdatedAt >= 0
+        && data.messageUpdatedAt is number && data.messageUpdatedAt >= 0
+        && data.hasPaymentScreenshot is bool
+        && data.hiddenFromAdmin is bool
+        && isValidAlertList(data.recentAlerts)
+        && data.serverCreatedAt is timestamp
+        && data.serverUpdatedAt is timestamp;
+    }
+
+    function isValidOrderReceipt(data, orderId) {
+      return data.keys().hasAll(['order_id', 'uid', 'paymentScreenshot', 'serverCreatedAt'])
+        && data.keys().hasOnly(['order_id', 'uid', 'paymentScreenshot', 'serverCreatedAt'])
+        && data.order_id is string && data.order_id == orderId && isValidOrderId(data.order_id)
+        && data.uid is string && data.uid.size() >= 10 && data.uid.size() <= 16 && data.uid.matches('^TRUST-[0-9]{4}$')
+        && data.paymentScreenshot is string
+        && data.paymentScreenshot.size() >= 40
+        && data.paymentScreenshot.size() <= 750000
+        && (
+          data.paymentScreenshot[0:22] == 'data:image/png;base64,'
+          || data.paymentScreenshot[0:23] == 'data:image/jpeg;base64,'
+          || data.paymentScreenshot[0:22] == 'data:image/jpg;base64,'
+          || data.paymentScreenshot[0:23] == 'data:image/webp;base64,'
+        )
+        && data.serverCreatedAt is timestamp;
+    }
+
+    function isValidAppConfig(data, configId) {
+      return configId in ['catalog', 'poster']
+        && data.keys().hasAll(['type', 'updatedAt', 'serverUpdatedAt'])
+        && data.keys().hasOnly(['type', 'catalog', 'posterImage', 'updatedAt', 'serverUpdatedAt'])
+        && data.type is string && data.type == configId
+        && data.updatedAt is number && data.updatedAt >= 0
+        && data.serverUpdatedAt is timestamp
+        && (!('catalog' in data) || data.catalog is map)
+        && (!('posterImage' in data) || (data.posterImage is string && data.posterImage.size() <= 750000));
+    }
+
+    function isValidAdminProfile(data) {
+      return data.keys().hasAll(['email', 'role', 'serverCreatedAt'])
+        && data.keys().hasOnly(['email', 'role', 'serverCreatedAt'])
+        && data.email is string && data.email.size() >= 5 && data.email.size() <= 160
+        && data.role is string && data.role == 'admin'
+        && data.serverCreatedAt is timestamp;
+    }
+
+    // Orders: Customers (no login) can create a strictly validated pending order and read ONLY their own order by unguessable 64-bit random orderId.
+    // Listing all orders, updating status/messages, and deleting orders are strictly Admin-only.
+    match /orders/{orderId} {
+      allow get: if isValidOrderId(orderId);
+      allow list: if isAdmin();
+      allow create: if isValidOrderId(orderId)
+        && isValidOrder(incoming(), orderId)
+        && incoming().serverCreatedAt == request.time
+        && incoming().serverUpdatedAt == request.time
+        && (
+          isAdmin()
+          || (
+            incoming().status == 'pending'
+            && incoming().adminMessage == ''
+            && incoming().hiddenFromAdmin == false
+            && incoming().recentAlerts.size() == 0
+          )
+        );
+      allow update: if isValidOrderId(orderId)
+        && isValidOrder(incoming(), orderId)
+        && isAdmin()
+        && incoming().serverUpdatedAt == request.time
+        && incoming().id == existing().id
+        && incoming().order_id == existing().order_id
+        && incoming().uid == existing().uid
+        && incoming()['service'] == existing()['service']
+        && incoming().pack == existing().pack
+        && incoming().price == existing().price
+        && incoming().amount == existing().amount
+        && incoming().link == existing().link
+        && incoming().date == existing().date
+        && incoming().createdAt == existing().createdAt
+        && incoming().serverCreatedAt == existing().serverCreatedAt
+        && (
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'status', 'adminMessage', 'statusUpdatedAt', 'messageUpdatedAt',
+            'hiddenFromAdmin', 'recentAlerts', 'serverUpdatedAt'
+          ])
+        );
+      allow delete: if isValidOrderId(orderId) && isAdmin();
+    }
+
+    // Isolated Admin-only payment screenshots (never exposed in list queries or non-admin reads)
+    match /order_receipts/{orderId} {
+      allow get: if isValidOrderId(orderId) && isAdmin();
+      allow list: if false;
+      allow create: if isValidOrderId(orderId)
+        && isValidOrderReceipt(incoming(), orderId)
+        && incoming().serverCreatedAt == request.time
+        && (
+          exists(/databases/$(database)/documents/orders/$(orderId))
+          || existsAfter(/databases/$(database)/documents/orders/$(orderId))
+        );
+      allow update: if false;
+      allow delete: if isValidOrderId(orderId) && isAdmin();
+    }
+
+    // Live Store Configuration (Catalog prices/services & Home Offer Poster)
+    match /app_config/{configId} {
+      allow get: if isValidId(configId) && configId in ['catalog', 'poster'];
+      allow list: if false;
+      allow create: if isValidId(configId)
+        && isValidAppConfig(incoming(), configId)
+        && isAdmin()
+        && incoming().serverUpdatedAt == request.time;
+      allow update: if isValidId(configId)
+        && isValidAppConfig(incoming(), configId)
+        && isAdmin()
+        && incoming().serverUpdatedAt == request.time
+        && incoming().type == existing().type
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'catalog', 'posterImage', 'updatedAt', 'serverUpdatedAt'
+        ]);
+      allow delete: if isValidId(configId) && isAdmin();
+    }
+
+    // Verified Admin Allowlist
+    match /admins/{adminUid} {
+      allow get: if isValidId(adminUid) && isVerifiedUser() && (request.auth.uid == adminUid || isAdmin());
+      allow list: if false;
+      allow create: if isValidId(adminUid)
+        && isValidAdminProfile(incoming())
+        && isAdmin()
+        && incoming().serverCreatedAt == request.time;
+      allow update: if false;
+      allow delete: if isValidId(adminUid) && isAdmin();
+    }
+  }
+}

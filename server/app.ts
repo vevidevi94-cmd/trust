@@ -1444,7 +1444,7 @@ export function createApiApp() {
     const orderNum = store.orderCounter++;
     const savedOrder: StoredOrder = {
       id: orderNum,
-      order_id: `ORD${now}_${crypto.randomInt(10, 99)}`,
+      order_id: `ORD${now}_${crypto.randomBytes(8).toString('hex')}`,
       service: service.name,
       pack: packTier.q,
       price: packTier.p,
@@ -1527,9 +1527,13 @@ export function createApiApp() {
     const visibleOrders = store.orders
       .filter((o) => !o.hiddenFromAdmin)
       .map(toAdminOrderDto);
+    const deletedIds = store.orders
+      .filter((o) => Boolean(o.hiddenFromAdmin))
+      .map((o) => o.order_id);
     res.json({
       ok: true,
       orders: visibleOrders,
+      deletedIds,
     });
   });
 

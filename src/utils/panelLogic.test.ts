@@ -491,3 +491,97 @@ test('mergeCustomerNotifications unions alerts without dropping messages and pre
   assert.equal(merged[1].id, 'N1');
   assert.equal(merged[1].read, true);
 });
+
+test('mergeAdminOrders monotonically adopts newer status/message from another Admin phone and blocks stale poll revert', () => {
+  const phone1Cached = [
+    {
+      id: 5,
+      order_id: 'ORD1795161137031_9f2a4c8e1b0d7a3c',
+      service: '1rs = 1k Reels Views',
+      pack: '1K Reels Views',
+      price: 1,
+      amount: 1,
+      link: 'https://instagram.com/reel/MULTI1/',
+      status: 'pending',
+      date: '20/11/2026',
+      createdAt: 1000,
+      statusUpdatedAt: 1000,
+      messageUpdatedAt: 1000,
+      uid: 'TRUST-5555',
+    },
+  ];
+  const phone2CloudUpdate = [
+    {
+      ...phone1Cached[0],
+      status: 'successful',
+      adminMessage: 'Order #5 Successful ✅',
+      statusUpdatedAt: 5000,
+      messageUpdatedAt: 5000,
+    },
+  ];
+  const afterCloud = mergeAdminOrders({
+    serverOrders: phone2CloudUpdate,
+    cachedOrders: phone1Cached,
+    deletedIds: new Set(),
+  });
+  assert.equal(afterCloud[0].status, 'successful');
+  assert.equal(afterCloud[0].adminMessage, 'Order #5 Successful ✅');
+
+  // Stale serverless poll arrives later with old pending state — must NOT revert Phone 2's edit
+  const stalePoll = [
+    {
+      ...phone1Cached[0],
+      status: 'pending',
+      adminMessage: undefined,
+      statusUpdatedAt: 0,
+      messageUpdatedAt: 0,
+    },
+  ];
+  const afterStalePoll = mergeAdminOrders({
+    serverOrders: stalePoll,
+    cachedOrders: afterCloud,
+    deletedIds: new Set(),
+  });
+  assert.equal(afterStalePoll[0].status, 'successful');
+  assert.equal(afterStalePoll[0].adminMessage, 'Order #5 Successful ✅');
+});
+
+test('mergeAdminOrders removes orders deleted on another Admin phone via cloud hiddenIds', () => {
+  const cached = [
+    {
+      id: 1,
+      order_id: 'ORD1795161137031_1111111111111111',
+      service: 'Reels',
+      pack: '1K',
+      price: 1,
+      amount: 1,
+      link: 'https://instagram.com/reel/A/',
+      status: 'successful',
+      date: '20/11/2026',
+      createdAt: 100,
+      uid: 'TRUST-1111',
+    },
+    {
+      id: 2,
+      order_id: 'ORD1795161137031_2222222222222222',
+      service: 'Reels',
+      pack: '2K',
+      price: 2,
+      amount: 2,
+      link: 'https://instagram.com/reel/B/',
+      status: 'payment_failed',
+      date: '20/11/2026',
+      createdAt: 200,
+      uid: 'TRUST-2222',
+    },
+  ];
+  const merged = mergeAdminOrders({
+    serverOrders: [cached[1]],
+    cachedOrders: cached,
+    deletedIds: new Set(['ORD1795161137031_1111111111111111']),
+  });
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0].order_id, 'ORD1795161137031_2222222222222222');
+  assert.equal(merged[0].status, 'payment_failed');
+});
+

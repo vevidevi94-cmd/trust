@@ -1,9 +1,11 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   BellRing,
   Check,
   CheckCircle2,
   Clock,
+  Cloud,
+  CloudOff,
   Copy,
   Eye,
   LogOut,
@@ -38,6 +40,12 @@ interface AdminViewProps {
   onSavePoster: (posterDataUrl: string | null) => Promise<boolean>;
   onShowToast: (message: string, isError?: boolean) => void;
   onTestSound: () => void;
+  cloudSyncEmail: string | null;
+  cloudSyncBusy: boolean;
+  cloudSyncError: string | null;
+  onConnectCloudSync: () => Promise<void>;
+  onDisconnectCloudSync: () => Promise<void>;
+  onLoadCloudReceipt: (orderId: string) => Promise<string | null>;
 }
 
 export function AdminView({
@@ -54,6 +62,12 @@ export function AdminView({
   onSavePoster,
   onShowToast,
   onTestSound,
+  cloudSyncEmail,
+  cloudSyncBusy,
+  cloudSyncError,
+  onConnectCloudSync,
+  onDisconnectCloudSync,
+  onLoadCloudReceipt,
 }: AdminViewProps) {
   const [activeTab, setActiveTab] = useState<'orders' | 'catalog'>('orders');
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -61,6 +75,51 @@ export function AdminView({
   const [notesById, setNotesById] = useState<Record<string, string>>({});
   const [previewImg, setPreviewImg] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [cloudReceipts, setCloudReceipts] = useState<Record<string, string>>({});
+  const [loadingReceipts, setLoadingReceipts] = useState<Record<string, boolean>>({});
+  const [cloudReceiptChecked, setCloudReceiptChecked] = useState<Record<string, boolean>>({});
+  const inFlightReceiptsRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    if (!cloudSyncEmail) return;
+    let cancelled = false;
+    for (const order of orders.slice(0, 60)) {
+      if (
+        order.hasPaymentScreenshot &&
+        !order.paymentScreenshot &&
+        !cloudReceipts[order.order_id] &&
+        !cloudReceiptChecked[order.order_id] &&
+        !inFlightReceiptsRef.current.has(order.order_id)
+      ) {
+        inFlightReceiptsRef.current.add(order.order_id);
+        setLoadingReceipts((prev) => ({ ...prev, [order.order_id]: true }));
+        void onLoadCloudReceipt(order.order_id)
+          .then((dataUrl) => {
+            if (cancelled) return;
+            if (dataUrl) {
+              setCloudReceipts((prev) =>
+                prev[order.order_id] === dataUrl ? prev : { ...prev, [order.order_id]: dataUrl },
+              );
+            }
+            setCloudReceiptChecked((prev) => ({ ...prev, [order.order_id]: true }));
+          })
+          .finally(() => {
+            inFlightReceiptsRef.current.delete(order.order_id);
+            if (!cancelled) {
+              setLoadingReceipts((prev) => {
+                if (!prev[order.order_id]) return prev;
+                const next = { ...prev };
+                delete next[order.order_id];
+                return next;
+              });
+            }
+          });
+      }
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [cloudReceiptChecked, cloudReceipts, cloudSyncEmail, onLoadCloudReceipt, orders]);
 
   const inProgressCount = orders.filter((o) => {
     const s = o.status.toLowerCase();
@@ -145,6 +204,64 @@ export function AdminView({
       >
         Admin Panel
       </h1>
+
+      {/* Multi-Phone Cloud Live Sync Bar */}
+      {cloudSyncEmail ? (
+        <div
+          data-testid="cloud-sync-active"
+          className="bg-[#e8f5e9] border border-[#a5d6a7] rounded-[14px] px-3 py-2 mb-3 flex items-center justify-between gap-2"
+        >
+          <div className="flex items-center gap-2 min-w-0">
+            <Cloud className="w-4 h-4 text-[#2e7d32] shrink-0" aria-hidden="true" />
+            <div className="min-w-0">
+              <div className="text-[12px] font-extrabold text-[#1b5e20] leading-tight">
+                All Phones Cloud Live Sync Active ✅
+              </div>
+              <div className="text-[11px] text-[#2e7d32] truncate">{cloudSyncEmail}</div>
+            </div>
+          </div>
+          <button
+            type="button"
+            disabled={cloudSyncBusy}
+            onClick={() => void onDisconnectCloudSync()}
+            className="text-[11px] font-bold text-[#2e7d32] bg-white border border-[#a5d6a7] px-2.5 py-1 rounded-[8px] cursor-pointer shrink-0 disabled:opacity-60"
+          >
+            Disconnect
+          </button>
+        </div>
+      ) : (
+        <div
+          data-testid="cloud-sync-prompt"
+          className="bg-[#fff8e1] border border-[#ffe082] rounded-[14px] px-3 py-2.5 mb-3"
+        >
+          <div className="flex items-start justify-between gap-2">
+            <div className="flex items-start gap-2 min-w-0">
+              <CloudOff className="w-4 h-4 text-[#b45309] mt-0.5 shrink-0" aria-hidden="true" />
+              <div className="min-w-0">
+                <div className="text-[12px] font-extrabold text-[#92400e] leading-tight">
+                  Live Cloud Sync Connect Karein
+                </div>
+                <div className="text-[11px] text-[#78350f] mt-0.5 leading-snug">
+                  Dusre phone me saare old orders, screenshots &amp; live updates ke liye 1-tap Google Connect karein.
+                </div>
+              </div>
+            </div>
+            <button
+              type="button"
+              disabled={cloudSyncBusy}
+              onClick={() => void onConnectCloudSync()}
+              className="bg-[#7c4dff] text-white px-3 py-1.5 rounded-[10px] text-[11.5px] font-extrabold cursor-pointer shrink-0 active:scale-95 disabled:opacity-60 whitespace-nowrap"
+            >
+              {cloudSyncBusy ? 'Connecting...' : 'Connect Google'}
+            </button>
+          </div>
+          {cloudSyncError && (
+            <div className="mt-1.5 text-[11px] font-bold text-[#c62828] bg-[#ffebee] border border-[#ffcdd2] rounded-[8px] px-2 py-1">
+              {cloudSyncError}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Admin Mode Tabs */}
       <div className="bg-white rounded-[16px] p-1.5 shadow-sm grid grid-cols-2 gap-1.5 mb-3">
@@ -258,40 +375,64 @@ export function AdminView({
                 </div>
 
                 {(() => {
-                  const screenshotSrc = order.paymentScreenshot || order.screenshotUrl;
-                  if (!screenshotSrc) return null;
+                  const isLoadingCloudReceipt = Boolean(loadingReceipts[order.order_id]);
+                  const directReceipt = order.paymentScreenshot || cloudReceipts[order.order_id];
+                  const screenshotSrc =
+                    directReceipt ||
+                    (cloudSyncEmail && isLoadingCloudReceipt ? '' : order.screenshotUrl || '');
+                  if (!screenshotSrc && !isLoadingCloudReceipt) return null;
                   return (
                     <div className="mt-2 bg-[#f8f5ff] border border-[#e9dffc] rounded-[12px] p-2">
                       <div className="flex items-center justify-between mb-1.5">
                         <span className="text-[12px] font-extrabold text-[#3a1d6d]">
                           Payment Screenshot:
                         </span>
+                        {screenshotSrc && (
+                          <button
+                            type="button"
+                            onClick={() => setPreviewImg(screenshotSrc)}
+                            className="text-[11px] font-bold text-[#7c4dff] inline-flex items-center gap-1 cursor-pointer"
+                          >
+                            <Eye className="w-3.5 h-3.5" />
+                            <span>View Full</span>
+                          </button>
+                        )}
+                      </div>
+                      {screenshotSrc ? (
                         <button
                           type="button"
                           onClick={() => setPreviewImg(screenshotSrc)}
-                          className="text-[11px] font-bold text-[#7c4dff] inline-flex items-center gap-1 cursor-pointer"
+                          className="w-full block cursor-pointer"
                         >
-                          <Eye className="w-3.5 h-3.5" />
-                          <span>View Full</span>
+                          <img
+                            src={screenshotSrc}
+                            alt={`Payment screenshot for order #${order.id}`}
+                            loading="lazy"
+                            onError={() => {
+                              if (cloudSyncEmail && !cloudReceipts[order.order_id]) {
+                                void onLoadCloudReceipt(order.order_id).then((dataUrl) => {
+                                  if (dataUrl) {
+                                    setCloudReceipts((prev) => ({
+                                      ...prev,
+                                      [order.order_id]: dataUrl,
+                                    }));
+                                  }
+                                });
+                              }
+                            }}
+                            className="w-full max-h-44 object-contain rounded-[8px] bg-white border border-[#e9dffc]"
+                          />
                         </button>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => setPreviewImg(screenshotSrc)}
-                        className="w-full block cursor-pointer"
-                      >
-                        <img
-                          src={screenshotSrc}
-                          alt={`Payment screenshot for order #${order.id}`}
-                          loading="lazy"
-                          className="w-full max-h-44 object-contain rounded-[8px] bg-white border border-[#e9dffc]"
-                        />
-                      </button>
+                      ) : (
+                        <div className="w-full h-24 rounded-[8px] bg-white border border-[#e9dffc] flex items-center justify-center text-[12px] font-bold text-[#7c4dff]">
+                          Loading Payment Screenshot...
+                        </div>
+                      )}
                     </div>
                   );
                 })()}
 
-                <div className="text-[11px] text-[#666] mt-1.5 tabular-nums">
+                <div className="text-[11px] text-[#666] mt-1.5 tabular-nums break-all">
                   {order.createdAt ? formatIndianDateTime(order.createdAt) : order.date} | {order.order_id}
                 </div>
 

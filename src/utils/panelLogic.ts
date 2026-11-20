@@ -82,15 +82,49 @@ export function mergeAdminOrders(params: {
     return order;
   };
 
-  for (const order of params.serverOrders) {
-    if (!params.deletedIds.has(order.order_id)) {
-      byId.set(order.order_id, applyOverride(order));
-    }
-  }
+  const mergeTwoOrders = (prev: OrderItem, incoming: OrderItem): OrderItem => {
+    const prevStatusTs = typeof prev.statusUpdatedAt === 'number' ? prev.statusUpdatedAt : 0;
+    const incStatusTs = typeof incoming.statusUpdatedAt === 'number' ? incoming.statusUpdatedAt : 0;
+    const prevMsgTs = typeof prev.messageUpdatedAt === 'number' ? prev.messageUpdatedAt : prevStatusTs;
+    const incMsgTs = typeof incoming.messageUpdatedAt === 'number' ? incoming.messageUpdatedAt : incStatusTs;
+
+    const useIncomingStatus = incStatusTs >= prevStatusTs;
+    const useIncomingMsg =
+      incMsgTs > prevMsgTs ||
+      (incMsgTs === prevMsgTs && Boolean(incoming.adminMessage || !prev.adminMessage));
+
+    const prevVer = Math.max(prevStatusTs, prevMsgTs);
+    const incVer = Math.max(incStatusTs, incMsgTs);
+
+    return {
+      ...(incVer >= prevVer ? incoming : prev),
+      status: useIncomingStatus ? incoming.status : prev.status,
+      statusUpdatedAt: Math.max(prevStatusTs, incStatusTs) || undefined,
+      adminMessage: useIncomingMsg ? incoming.adminMessage : prev.adminMessage,
+      messageUpdatedAt: Math.max(prevMsgTs, incMsgTs) || undefined,
+      paymentScreenshot: incoming.paymentScreenshot || prev.paymentScreenshot,
+      screenshotUrl: incoming.screenshotUrl || prev.screenshotUrl,
+      hasPaymentScreenshot: Boolean(
+        incoming.hasPaymentScreenshot ||
+          prev.hasPaymentScreenshot ||
+          incoming.paymentScreenshot ||
+          prev.paymentScreenshot ||
+          incoming.screenshotUrl ||
+          prev.screenshotUrl,
+      ),
+    };
+  };
+
   for (const cached of params.cachedOrders) {
-    if (!params.deletedIds.has(cached.order_id) && !byId.has(cached.order_id)) {
+    if (!params.deletedIds.has(cached.order_id)) {
       byId.set(cached.order_id, applyOverride(cached));
     }
+  }
+  for (const order of params.serverOrders) {
+    if (params.deletedIds.has(order.order_id)) continue;
+    const prev = byId.get(order.order_id);
+    const combined = prev ? mergeTwoOrders(prev, order) : order;
+    byId.set(order.order_id, applyOverride(combined));
   }
   return Array.from(byId.values()).sort(
     (a, b) => (b.createdAt || 0) - (a.createdAt || 0) || b.id - a.id,

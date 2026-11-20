@@ -1,0 +1,232 @@
+{
+  "entities": {
+    "Order": {
+      "title": "Order",
+      "description": "Customer direct-payment order synced across all Admin devices and the customer's My Orders view.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "description": "Display numeric order index"
+        },
+        "order_id": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 64,
+          "pattern": "^ORD[0-9]+_[a-zA-Z0-9]+$",
+          "description": "Unique unguessable order document identifier"
+        },
+        "uid": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 16,
+          "pattern": "^TRUST-[0-9]{4}$",
+          "description": "Customer device identifier"
+        },
+        "service": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "description": "Ordered service title"
+        },
+        "pack": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "description": "Selected package tier label"
+        },
+        "price": {
+          "type": "number",
+          "description": "Order unit price in INR"
+        },
+        "amount": {
+          "type": "number",
+          "description": "Total order amount in INR"
+        },
+        "link": {
+          "type": "string",
+          "minLength": 5,
+          "maxLength": 500,
+          "description": "Customer social media target URL"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "successful", "payment_failed"],
+          "description": "Current fulfillment status (pending displays as In Progress)"
+        },
+        "adminMessage": {
+          "type": "string",
+          "maxLength": 500,
+          "description": "Latest message sent by Admin to the customer for this order"
+        },
+        "date": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 64,
+          "description": "Formatted IST order timestamp"
+        },
+        "createdAt": {
+          "type": "number",
+          "description": "Epoch milliseconds when order was created"
+        },
+        "statusUpdatedAt": {
+          "type": "number",
+          "description": "Monotonic epoch milliseconds of the latest Admin status update"
+        },
+        "messageUpdatedAt": {
+          "type": "number",
+          "description": "Monotonic epoch milliseconds of the latest Admin direct message"
+        },
+        "hasPaymentScreenshot": {
+          "type": "boolean",
+          "description": "Whether a payment screenshot receipt exists in order_receipts"
+        },
+        "hiddenFromAdmin": {
+          "type": "boolean",
+          "description": "True only after Admin manually deletes the order from Live Orders"
+        },
+        "recentAlerts": {
+          "type": "array",
+          "description": "Bounded list (max 25) of Admin status/message alerts for this order"
+        },
+        "serverCreatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server-validated creation timestamp"
+        },
+        "serverUpdatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server-validated last update timestamp"
+        }
+      },
+      "required": [
+        "id",
+        "order_id",
+        "uid",
+        "service",
+        "pack",
+        "price",
+        "amount",
+        "link",
+        "status",
+        "adminMessage",
+        "date",
+        "createdAt",
+        "statusUpdatedAt",
+        "messageUpdatedAt",
+        "hasPaymentScreenshot",
+        "hiddenFromAdmin",
+        "recentAlerts",
+        "serverCreatedAt",
+        "serverUpdatedAt"
+      ]
+    },
+    "OrderReceipt": {
+      "title": "OrderReceipt",
+      "description": "Admin-only isolated payment screenshot document for an order.",
+      "type": "object",
+      "properties": {
+        "order_id": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 64,
+          "pattern": "^ORD[0-9]+_[a-zA-Z0-9]+$",
+          "description": "Parent order identifier"
+        },
+        "uid": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 16,
+          "pattern": "^TRUST-[0-9]{4}$",
+          "description": "Customer device identifier"
+        },
+        "paymentScreenshot": {
+          "type": "string",
+          "minLength": 40,
+          "maxLength": 750000,
+          "description": "Compressed data URL of the payment screenshot"
+        },
+        "serverCreatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server-validated creation timestamp"
+        }
+      },
+      "required": ["order_id", "uid", "paymentScreenshot", "serverCreatedAt"]
+    },
+    "AppConfig": {
+      "title": "AppConfig",
+      "description": "Live store configuration managed by Admin (service catalog overrides and Home offer poster).",
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["catalog", "poster"],
+          "description": "Configuration document kind"
+        },
+        "catalog": {
+          "type": "object",
+          "description": "Native map of category keys to service arrays when type is catalog"
+        },
+        "posterImage": {
+          "type": "string",
+          "maxLength": 750000,
+          "description": "Compressed offer poster data URL (or empty string for default poster) when type is poster"
+        },
+        "updatedAt": {
+          "type": "number",
+          "description": "Monotonic version timestamp in epoch milliseconds"
+        },
+        "serverUpdatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server-validated update timestamp"
+        }
+      },
+      "required": ["type", "updatedAt", "serverUpdatedAt"]
+    },
+    "AdminProfile": {
+      "title": "AdminProfile",
+      "description": "Authorized admin registry document keyed by Firebase Auth UID.",
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 160,
+          "description": "Verified admin Google email"
+        },
+        "role": {
+          "type": "string",
+          "enum": ["admin"],
+          "description": "Admin role marker"
+        },
+        "serverCreatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server-validated creation timestamp"
+        }
+      },
+      "required": ["email", "role", "serverCreatedAt"]
+    }
+  },
+  "firestore": {
+    "/orders/{orderId}": {
+      "schema": { "$ref": "#/entities/Order" },
+      "description": "Live customer orders synced in real time to all Admin devices and individually readable by order owner via unguessable orderId"
+    },
+    "/order_receipts/{orderId}": {
+      "schema": { "$ref": "#/entities/OrderReceipt" },
+      "description": "Isolated Admin-only payment screenshots so screenshots are never exposed in list queries or readable by non-admins"
+    },
+    "/app_config/{configId}": {
+      "schema": { "$ref": "#/entities/AppConfig" },
+      "description": "Live service catalog and Home offer poster configuration editable only by Admin"
+    },
+    "/admins/{adminUid}": {
+      "schema": { "$ref": "#/entities/AdminProfile" },
+      "description": "Verified admin user allowlist documents"
+    }
+  }
+}

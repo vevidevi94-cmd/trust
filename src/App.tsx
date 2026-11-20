@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { onAuthStateChanged } from 'firebase/auth';
 import {
   CATEGORIES,
   SERVICE_CATALOG,
@@ -12,6 +13,7 @@ import {
 import {
   countUnreadNotifications,
   detectNewOrderIds,
+  formatIndianDateTime,
   mergeAdminOrders,
   mergeCustomerNotifications,
   mergeCustomerOrders,
@@ -23,6 +25,25 @@ import {
   type AdminStatusOverride,
   type ServiceCatalogOverrideItem,
 } from './utils/panelLogic';
+import {
+  auth,
+  isVerifiedAdminUser,
+  signInAdminGoogle,
+  signOutAdminGoogle,
+} from './firebase';
+import {
+  backfillLocalOrdersToFirestore,
+  createOrderInFirestore,
+  fetchOrderReceiptFromFirestore,
+  hideOrderInFirestore,
+  isValidFirestoreOrderId,
+  saveCatalogInFirestore,
+  savePosterInFirestore,
+  subscribeAdminOrders,
+  subscribeAppConfigInFirestore,
+  subscribeCustomerOrderDoc,
+  syncAdminOrderUpdateToFirestore,
+} from './utils/firestoreSync';
 import {
   playClickSound,
   playIphoneNotification3Sec,
@@ -254,6 +275,10 @@ export default function App() {
 
   const [isAdminLoggedIn, setIsAdminLoggedIn] = useState<boolean>(false);
   const [adminOrders, setAdminOrders] = useState<OrderItem[]>([]);
+  const [cloudSyncEmail, setCloudSyncEmail] = useState<string | null>(null);
+  const [cloudSyncBusy, setCloudSyncBusy] = useState<boolean>(false);
+  const [cloudSyncError, setCloudSyncError] = useState<string | null>(null);
+  const cloudSyncActiveRef = useRef<boolean>(false);
 
   const [activePage, setActivePage] = useState<ActivePage>(() => {
     const parsed = parseHashPage(window.location.hash);
@@ -342,6 +367,19 @@ export default function App() {
       // Ignore storage quota errors
     }
   }, [supportMessages, orders, notifications]);
+
+  // Track Firebase Admin Google Auth session for cross-device real-time Firestore cloud sync
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      const ok = isVerifiedAdminUser(user);
+      cloudSyncActiveRef.current = ok;
+      setCloudSyncEmail(ok && user?.email ? user.email : null);
+      if (ok) {
+        setCloudSyncError(null);
+      }
+    });
+    return () => unsubscribe();
+  }, []);
 
   // Verify admin HttpOnly cookie session on mount
   useEffect(() => {
@@ -475,7 +513,7 @@ export default function App() {
     [],
   );
 
-  // Apply live SSE customer order/notification push immediately without waiting for poll
+  // Apply live SSE or Firestore customer order/notification push immediately without waiting for poll
   const applyLiveCustomerPush = useCallback(
     (payload: { order?: OrderItem; notification?: CustomerNotification }) => {
       if (payload.order) {
@@ -484,7 +522,6 @@ export default function App() {
           mergeCustomerOrders({
             serverOrders: [pushedOrder],
             cachedOrders: prev,
-            uid: uidRef.current !== 'TRUST-...' ? uidRef.current : pushedOrder.uid,
           }),
         );
       }
@@ -757,6 +794,122 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [syncLiveCatalog]);
 
+  // Real-time Firestore cloud subscription for live service prices & Home Offer Poster across all devices
+  useEffect(() => {
+    return subscribeAppConfigInFirestore({
+      onCatalog: (cloudCatalog, serverTs) => {
+        if (
+          !shouldAdoptServerVersion({
+            localUpdatedAt: catalogUpdatedAtRef.current,
+            serverUpdatedAt: serverTs,
+          })
+        ) {
+          return;
+        }
+        const merged = mergeLiveCatalog(SERVICE_CATALOG, cloudCatalog);
+        const mergedJson = serializeCatalogForDiff(merged);
+        if (mergedJson !== liveCatalogJsonRef.current) {
+          liveCatalogJsonRef.current = mergedJson;
+          liveCatalogRef.current = merged;
+          setLiveCatalog(merged);
+        }
+        if (serverTs > 0) {
+          catalogUpdatedAtRef.current = Math.max(catalogUpdatedAtRef.current, serverTs);
+        }
+        try {
+          if (cloudCatalog) {
+            localStorage.setItem(STORAGE_LIVE_CATALOG_KEY, JSON.stringify(cloudCatalog));
+          } else {
+            localStorage.removeItem(STORAGE_LIVE_CATALOG_KEY);
+          }
+          if (catalogUpdatedAtRef.current > 0) {
+            localStorage.setItem(
+              STORAGE_LIVE_CATALOG_UPDATED_AT_KEY,
+              String(catalogUpdatedAtRef.current),
+            );
+          }
+        } catch {
+          // Ignore storage quota errors
+        }
+      },
+      onPoster: (cloudPoster, serverTs) => {
+        if (
+          !shouldAdoptServerVersion({
+            localUpdatedAt: posterUpdatedAtRef.current,
+            serverUpdatedAt: serverTs,
+          })
+        ) {
+          return;
+        }
+        if (cloudPoster !== livePosterRef.current) {
+          livePosterRef.current = cloudPoster;
+          setLivePoster(cloudPoster);
+        }
+        if (serverTs > 0) {
+          posterUpdatedAtRef.current = Math.max(posterUpdatedAtRef.current, serverTs);
+        }
+        try {
+          if (cloudPoster) {
+            localStorage.setItem(STORAGE_LIVE_POSTER_KEY, cloudPoster);
+          } else {
+            localStorage.removeItem(STORAGE_LIVE_POSTER_KEY);
+          }
+          if (posterUpdatedAtRef.current > 0) {
+            localStorage.setItem(
+              STORAGE_LIVE_POSTER_UPDATED_AT_KEY,
+              String(posterUpdatedAtRef.current),
+            );
+          }
+        } catch {
+          // Ignore storage quota errors
+        }
+      },
+    });
+  }, []);
+
+  // Real-time Firestore listener on each of the Customer's own orders (instant status/message push without login)
+  const customerCloudOrderIdsKey = orders
+    .map((o) => o.order_id)
+    .filter(isValidFirestoreOrderId)
+    .slice(0, 20)
+    .join(',');
+
+  useEffect(() => {
+    if (!customerCloudOrderIdsKey) return;
+    const ids = customerCloudOrderIdsKey.split(',').filter(Boolean);
+    const unsubs = ids.map((orderId) =>
+      subscribeCustomerOrderDoc(orderId, (updatedOrder, cloudAlerts) => {
+        applyLiveCustomerPush({ order: updatedOrder });
+        if (cloudAlerts.length > 0) {
+          if (knownCustomerNotifIdsRef.current === null) {
+            knownCustomerNotifIdsRef.current = new Set(cloudAlerts.map((a) => a.id));
+          } else {
+            const fresh = cloudAlerts.filter((a) => !knownCustomerNotifIdsRef.current!.has(a.id));
+            if (fresh.length > 0) {
+              for (const a of fresh) {
+                knownCustomerNotifIdsRef.current.add(a.id);
+              }
+              const latest = fresh[0];
+              showToast(
+                `🔔 ${latest.message}`,
+                latest.status.toLowerCase() === 'payment_failed',
+              );
+            }
+          }
+          setNotifications((prev) =>
+            mergeCustomerNotifications({
+              serverNotifications: cloudAlerts,
+              cachedNotifications: prev,
+            }),
+          );
+        }
+      }),
+    );
+    return () => {
+      for (const unsub of unsubs) unsub();
+    };
+  }, [applyLiveCustomerPush, customerCloudOrderIdsKey, showToast]);
+
   // Real-time SSE stream for instant Customer Bell notifications, My Orders updates & live catalog/poster updates
   useEffect(() => {
     if (typeof EventSource === 'undefined' || !userToken) return;
@@ -839,11 +992,19 @@ export default function App() {
         const data = (await res.json()) as {
           ok?: boolean;
           orders?: OrderItem[];
+          deletedIds?: string[];
         };
         if (reqSeq !== adminSyncSeqRef.current || !data.ok) return;
 
         const incomingOrders = Array.isArray(data.orders) ? data.orders : [];
-        const deletedIds = new Set(readAdminDeletedIds());
+        const serverDeletedIds = Array.isArray(data.deletedIds)
+          ? data.deletedIds.filter((x): x is string => typeof x === 'string')
+          : [];
+        const mergedDeletedArr = Array.from(new Set([...readAdminDeletedIds(), ...serverDeletedIds]));
+        if (serverDeletedIds.length > 0) {
+          saveAdminDeletedIds(mergedDeletedArr);
+        }
+        const deletedIds = new Set(mergedDeletedArr);
         const statusOverrides = readAdminStatusOverrides();
         const merged = mergeAdminOrders({
           serverOrders: incomingOrders,
@@ -938,7 +1099,25 @@ export default function App() {
         }
         void syncAdminOverview(false, true);
       };
-      const onOrderDeleted = () => {
+      const onOrderDeleted = (evt: Event) => {
+        const msgEvt = evt as MessageEvent<string>;
+        if (msgEvt.data) {
+          try {
+            const parsed = JSON.parse(msgEvt.data) as { order_id?: string };
+            if (typeof parsed.order_id === 'string' && parsed.order_id) {
+              const delId = parsed.order_id;
+              saveAdminDeletedIds(Array.from(new Set([...readAdminDeletedIds(), delId])));
+              setAdminOrders((prev) => {
+                const next = prev.filter((o) => o.order_id !== delId);
+                saveCachedAdminOrders(next);
+                return next;
+              });
+              return;
+            }
+          } catch {
+            // Fallback to full overview fetch
+          }
+        }
         void syncAdminOverview(false, true);
       };
       const onCatalogChange = () => {
@@ -955,6 +1134,75 @@ export default function App() {
       if (es) es.close();
     };
   }, [applyLiveAdminOrderPush, isAdminLoggedIn, syncAdminOverview, syncLiveCatalog]);
+
+  // Real-time Firestore cloud subscription for Admin Panel (all old orders on new phone + simultaneous push to all 2-3 Admin phones)
+  useEffect(() => {
+    if (!isAdminLoggedIn || !cloudSyncEmail) return;
+    let isFirstCloudSnapshot = true;
+
+    const unsubscribe = subscribeAdminOrders(
+      ({ orders: cloudOrders, hiddenIds }) => {
+        const mergedDeleted = Array.from(new Set([...readAdminDeletedIds(), ...hiddenIds]));
+        if (hiddenIds.length > 0) {
+          saveAdminDeletedIds(mergedDeleted);
+        }
+        const deletedIds = new Set(mergedDeleted);
+        const statusOverrides = readAdminStatusOverrides();
+        const merged = mergeAdminOrders({
+          serverOrders: cloudOrders,
+          cachedOrders:
+            adminOrdersRef.current.length > 0 ? adminOrdersRef.current : readCachedAdminOrders(),
+          deletedIds,
+          statusOverrides,
+        });
+
+        if (isFirstCloudSnapshot) {
+          isFirstCloudSnapshot = false;
+          if (knownAdminOrderIdsRef.current === null) {
+            knownAdminOrderIdsRef.current = new Set(merged.map((o) => o.order_id));
+          } else {
+            for (const o of merged) {
+              knownAdminOrderIdsRef.current.add(o.order_id);
+            }
+          }
+          // Backfill any local-only orders from this phone into Firestore so other phones see them too
+          const cloudIds = new Set([...cloudOrders.map((o) => o.order_id), ...hiddenIds]);
+          const localOnly = merged.filter((o) => !cloudIds.has(o.order_id));
+          if (localOnly.length > 0) {
+            void backfillLocalOrdersToFirestore(localOnly, cloudIds);
+          }
+        } else {
+          if (knownAdminOrderIdsRef.current === null) {
+            knownAdminOrderIdsRef.current = new Set();
+          }
+          const newIds = detectNewOrderIds(knownAdminOrderIdsRef.current, merged);
+          if (newIds.length > 0) {
+            for (const id of newIds) {
+              knownAdminOrderIdsRef.current.add(id);
+            }
+            const newest = merged.find((o) => o.order_id === newIds[0]);
+            playIphoneNotification3Sec();
+            showToast(
+              newest
+                ? `🔔 New Order #${newest.id} (₹${newest.price}) • ${newest.service}`
+                : '🔔 New Live Order Received!',
+            );
+          }
+        }
+
+        saveCachedAdminOrders(merged);
+        setAdminOrders(merged);
+      },
+      (err) => {
+        const msg = err instanceof Error ? err.message : 'Cloud sync permission error';
+        if (msg.includes('permission') || msg.includes('PERMISSION_DENIED')) {
+          setCloudSyncError('Cloud Sync permission denied — authorized Admin Google account se sign in karein');
+        }
+      },
+    );
+
+    return () => unsubscribe();
+  }, [cloudSyncEmail, isAdminLoggedIn, showToast]);
 
   // Cross-tab instant sync via BroadcastChannel (<10ms latency between customer & admin tabs)
   useEffect(() => {
@@ -1221,6 +1469,9 @@ export default function App() {
           return false;
         }
 
+        // Await atomic Firestore write (order + isolated screenshot) BEFORE showing Order Processing
+        // so ALL Admin phones immediately receive both the order and its payment screenshot.
+        await createOrderInFirestore(data.order, screenshot);
         setOrders((prev) => [data.order!, ...prev]);
         setCheckoutState(null);
         setProcessingOrder(data.order);
@@ -1339,6 +1590,29 @@ export default function App() {
     });
   }, [currentCategory, pushNavState, showToast]);
 
+  const handleConnectCloudSync = useCallback(async () => {
+    playClickSound();
+    unlockAudioContext();
+    setCloudSyncBusy(true);
+    setCloudSyncError(null);
+    const result = await signInAdminGoogle();
+    setCloudSyncBusy(false);
+    if (!result.ok) {
+      setCloudSyncError(result.message || 'Cloud Sync connect nahi hua ❌');
+      showToast(result.message || 'Cloud Sync connect nahi hua ❌', true);
+      return;
+    }
+    showToast('All Phones Cloud Live Sync Connected ✅');
+  }, [showToast]);
+
+  const handleDisconnectCloudSync = useCallback(async () => {
+    playClickSound();
+    setCloudSyncBusy(true);
+    await signOutAdminGoogle();
+    setCloudSyncBusy(false);
+    showToast('Cloud Sync Disconnected');
+  }, [showToast]);
+
   const buildOrderSnapshot = (orderId: string) => {
     const found = adminOrdersRef.current.find((o) => o.order_id === orderId);
     if (!found) return undefined;
@@ -1393,28 +1667,69 @@ export default function App() {
         return next;
       });
 
+      const targetOrderBefore = adminOrdersRef.current.find((o) => o.order_id === orderId);
+      const defaultAlertText =
+        status === 'successful'
+          ? `Order #${targetOrderBefore?.id ?? ''} Successful ✅`.replace(/\s+/g, ' ').trim()
+          : status === 'payment_failed'
+            ? `Order #${targetOrderBefore?.id ?? ''} Payment Failed ❌`.replace(/\s+/g, ' ').trim()
+            : `Order #${targetOrderBefore?.id ?? ''} is In Progress ⏳`.replace(/\s+/g, ' ').trim();
+      const outgoingAlertText = (note || defaultAlertText).trim();
+      const fallbackNotifId = `NTF_${orderId}_${updatedAt}`;
+
       try {
-        const res = await fetch('/api/admin/order-status', {
+        const apiPromise = fetch('/api/admin/order-status', {
           method: 'POST',
           credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ order_id: orderId, status, note, orderSnapshot }),
-        });
-        const data = (await res.json().catch(() => ({}))) as {
-          ok?: boolean;
-          order?: OrderItem;
-          customerOrder?: OrderItem;
-          notification?: CustomerNotification;
-          message?: string;
-        };
-        if (!res.ok || !data.ok) {
+        })
+          .then(async (res) => {
+            const data = (await res.json().catch(() => ({}))) as {
+              ok?: boolean;
+              order?: OrderItem;
+              customerOrder?: OrderItem;
+              notification?: CustomerNotification;
+              message?: string;
+            };
+            return { ok: Boolean(res.ok && data.ok), data };
+          })
+          .catch(() => ({ ok: false, data: {} as { ok?: boolean; order?: OrderItem; customerOrder?: OrderItem; notification?: CustomerNotification; message?: string } }));
+
+        const cloudPromise =
+          cloudSyncActiveRef.current && targetOrderBefore
+            ? syncAdminOrderUpdateToFirestore({
+                order: targetOrderBefore,
+                status,
+                adminMessage: outgoingAlertText,
+                statusUpdatedAt: updatedAt,
+                messageUpdatedAt: Math.max(
+                  updatedAt,
+                  typeof targetOrderBefore.messageUpdatedAt === 'number'
+                    ? targetOrderBefore.messageUpdatedAt
+                    : 0,
+                ),
+                newAlert: {
+                  id: fallbackNotifId,
+                  status,
+                  message: outgoingAlertText,
+                  date: formatIndianDateTime(updatedAt),
+                  createdAt: updatedAt,
+                },
+              })
+            : Promise.resolve(false);
+
+        const [apiRes, cloudOk] = await Promise.all([apiPromise, cloudPromise]);
+        const data = apiRes.data;
+
+        if (!apiRes.ok && !cloudOk) {
           showToast(data.message || 'Failed to update order status ❌', true);
           return;
         }
 
         const confirmedStatusTs =
           typeof data.order?.statusUpdatedAt === 'number' ? data.order.statusUpdatedAt : updatedAt;
-        const confirmedMsg = data.order?.adminMessage ?? note;
+        const confirmedMsg = data.order?.adminMessage ?? outgoingAlertText;
         saveAdminStatusOverrides({
           ...readAdminStatusOverrides(),
           [orderId]: { status, adminMessage: confirmedMsg, updatedAt: confirmedStatusTs },
@@ -1448,11 +1763,16 @@ export default function App() {
       playClickSound();
       adminSyncSeqRef.current += 1;
       try {
-        const res = await fetch(`/api/admin/orders/${encodeURIComponent(orderId)}`, {
-          method: 'DELETE',
-          credentials: 'same-origin',
-        });
-        if (!res.ok) {
+        const [apiOk, cloudOk] = await Promise.all([
+          fetch(`/api/admin/orders/${encodeURIComponent(orderId)}`, {
+            method: 'DELETE',
+            credentials: 'same-origin',
+          })
+            .then((r) => r.ok)
+            .catch(() => false),
+          cloudSyncActiveRef.current ? hideOrderInFirestore(orderId) : Promise.resolve(false),
+        ]);
+        if (!apiOk && !cloudOk) {
           showToast('Delete failed ❌', true);
           return;
         }
@@ -1481,35 +1801,69 @@ export default function App() {
     async ({ orderId, message }: { orderId: string; message: string }): Promise<boolean> => {
       playClickSound();
       adminSyncSeqRef.current += 1;
+      const msgTs = Date.now();
       const orderSnapshot = buildOrderSnapshot(orderId);
+      const targetOrderBefore = adminOrdersRef.current.find((o) => o.order_id === orderId);
+      const normalizedStatus =
+        targetOrderBefore?.status === 'successful' || targetOrderBefore?.status === 'payment_failed'
+          ? targetOrderBefore.status
+          : 'pending';
+
       try {
-        const res = await fetch('/api/admin/order-message', {
+        const apiPromise = fetch('/api/admin/order-message', {
           method: 'POST',
           credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ order_id: orderId, message, orderSnapshot }),
-        });
-        const data = (await res.json().catch(() => ({}))) as {
-          ok?: boolean;
-          order?: OrderItem;
-          customerOrder?: OrderItem;
-          notification?: CustomerNotification;
-          message?: string;
-        };
-        if (!res.ok || !data.ok) {
+        })
+          .then(async (res) => {
+            const data = (await res.json().catch(() => ({}))) as {
+              ok?: boolean;
+              order?: OrderItem;
+              customerOrder?: OrderItem;
+              notification?: CustomerNotification;
+              message?: string;
+            };
+            return { ok: Boolean(res.ok && data.ok), data };
+          })
+          .catch(() => ({ ok: false, data: {} as { ok?: boolean; order?: OrderItem; customerOrder?: OrderItem; notification?: CustomerNotification; message?: string } }));
+
+        const cloudPromise =
+          cloudSyncActiveRef.current && targetOrderBefore
+            ? syncAdminOrderUpdateToFirestore({
+                order: targetOrderBefore,
+                status: normalizedStatus,
+                adminMessage: message,
+                statusUpdatedAt:
+                  typeof targetOrderBefore.statusUpdatedAt === 'number'
+                    ? targetOrderBefore.statusUpdatedAt
+                    : 0,
+                messageUpdatedAt: msgTs,
+                newAlert: {
+                  id: `MSG_${orderId}_${msgTs}`,
+                  status: normalizedStatus,
+                  message,
+                  date: formatIndianDateTime(msgTs),
+                  createdAt: msgTs,
+                },
+              })
+            : Promise.resolve(false);
+
+        const [apiRes, cloudOk] = await Promise.all([apiPromise, cloudPromise]);
+        const data = apiRes.data;
+
+        if (!apiRes.ok && !cloudOk) {
           showToast(data.message || 'Message send failed ❌', true);
           return false;
         }
-        const msgTs =
-          typeof data.order?.messageUpdatedAt === 'number'
-            ? data.order.messageUpdatedAt
-            : Date.now();
+        const confirmedMsgTs =
+          typeof data.order?.messageUpdatedAt === 'number' ? data.order.messageUpdatedAt : msgTs;
         const overrides = readAdminStatusOverrides();
         if (overrides[orderId]) {
           overrides[orderId] = {
             ...overrides[orderId],
             adminMessage: message,
-            updatedAt: Math.max(overrides[orderId].updatedAt, msgTs),
+            updatedAt: Math.max(overrides[orderId].updatedAt, confirmedMsgTs),
           };
           saveAdminStatusOverrides(overrides);
         }
@@ -1518,7 +1872,9 @@ export default function App() {
         } else {
           setAdminOrders((prev) => {
             const next = prev.map((o) =>
-              o.order_id === orderId ? { ...o, adminMessage: message, messageUpdatedAt: msgTs } : o,
+              o.order_id === orderId
+                ? { ...o, adminMessage: message, messageUpdatedAt: confirmedMsgTs }
+                : o,
             );
             saveCachedAdminOrders(next);
             return next;
@@ -1587,6 +1943,9 @@ export default function App() {
         } catch {
           // Ignore storage errors
         }
+        if (cloudSyncActiveRef.current) {
+          void saveCatalogInFirestore(appliedPayload, savedTs);
+        }
         broadcastLiveSignal('catalog_updated');
         showToast('Prices & Service Live Updated ✅');
         return true;
@@ -1639,6 +1998,9 @@ export default function App() {
         }
       } catch {
         // Ignore storage errors
+      }
+      if (cloudSyncActiveRef.current) {
+        void saveCatalogInFirestore(null, savedTs);
       }
       broadcastLiveSignal('catalog_updated');
       showToast('All Services Reset to Default ✅');
@@ -1696,6 +2058,9 @@ export default function App() {
           localStorage.setItem(STORAGE_LIVE_POSTER_UPDATED_AT_KEY, String(savedTs));
         } catch {
           // Ignore storage errors
+        }
+        if (cloudSyncActiveRef.current) {
+          void savePosterInFirestore(nextPoster, savedTs);
         }
         broadcastLiveSignal('catalog_updated');
         showToast(nextPoster ? 'Home Poster Live Updated ✅' : 'Default Poster Restored ✅');
@@ -1838,6 +2203,12 @@ export default function App() {
               playIphoneNotification3Sec();
               showToast('🔔 3s iPhone Notification Alert Played');
             }}
+            cloudSyncEmail={cloudSyncEmail}
+            cloudSyncBusy={cloudSyncBusy}
+            cloudSyncError={cloudSyncError}
+            onConnectCloudSync={handleConnectCloudSync}
+            onDisconnectCloudSync={handleDisconnectCloudSync}
+            onLoadCloudReceipt={fetchOrderReceiptFromFirestore}
           />
         )}
       </main>
