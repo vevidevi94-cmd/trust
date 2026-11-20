@@ -43,9 +43,15 @@ interface AdminViewProps {
   cloudSyncEmail: string | null;
   cloudSyncBusy: boolean;
   cloudSyncError: string | null;
+  adminToken?: string;
   onConnectCloudSync: () => Promise<void>;
   onDisconnectCloudSync: () => Promise<void>;
   onLoadCloudReceipt: (orderId: string) => Promise<string | null>;
+}
+
+function appendAdminTokenToUrl(url: string, adminToken?: string): string {
+  if (!url || !adminToken || url.includes('adminToken=')) return url;
+  return `${url}${url.includes('?') ? '&' : '?'}adminToken=${encodeURIComponent(adminToken)}`;
 }
 
 export function AdminView({
@@ -65,6 +71,7 @@ export function AdminView({
   cloudSyncEmail,
   cloudSyncBusy,
   cloudSyncError,
+  adminToken,
   onConnectCloudSync,
   onDisconnectCloudSync,
   onLoadCloudReceipt,
@@ -77,49 +84,82 @@ export function AdminView({
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [cloudReceipts, setCloudReceipts] = useState<Record<string, string>>({});
   const [loadingReceipts, setLoadingReceipts] = useState<Record<string, boolean>>({});
-  const [cloudReceiptChecked, setCloudReceiptChecked] = useState<Record<string, boolean>>({});
+  const [failedServerImgIds, setFailedServerImgIds] = useState<Record<string, boolean>>({});
   const inFlightReceiptsRef = useRef<Set<string>>(new Set());
+  const checkedReceiptsRef = useRef<Set<string>>(new Set());
+  const retriedReceiptsRef = useRef<Set<string>>(new Set());
+  const mountedRef = useRef<boolean>(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  // Reset checked cache whenever Google Cloud Sync newly connects so all old orders load receipts
+  useEffect(() => {
+    if (cloudSyncEmail) {
+      checkedReceiptsRef.current.clear();
+      retriedReceiptsRef.current.clear();
+    }
+  }, [cloudSyncEmail]);
+
+  const loadCloudReceiptForOrder = React.useCallback(
+    (orderId: string, allowAutoRetry = true) => {
+      if (!cloudSyncEmail) return;
+      if (inFlightReceiptsRef.current.has(orderId)) return;
+      inFlightReceiptsRef.current.add(orderId);
+      setLoadingReceipts((prev) => (prev[orderId] ? prev : { ...prev, [orderId]: true }));
+
+      void onLoadCloudReceipt(orderId)
+        .then((dataUrl) => {
+          if (!mountedRef.current) return;
+          if (dataUrl) {
+            checkedReceiptsRef.current.add(orderId);
+            setCloudReceipts((prev) =>
+              prev[orderId] === dataUrl ? prev : { ...prev, [orderId]: dataUrl },
+            );
+          } else if (allowAutoRetry && !retriedReceiptsRef.current.has(orderId)) {
+            retriedReceiptsRef.current.add(orderId);
+            window.setTimeout(() => {
+              if (mountedRef.current) {
+                loadCloudReceiptForOrder(orderId, false);
+              }
+            }, 1500);
+          } else {
+            checkedReceiptsRef.current.add(orderId);
+          }
+        })
+        .finally(() => {
+          inFlightReceiptsRef.current.delete(orderId);
+          if (mountedRef.current) {
+            setLoadingReceipts((prev) => {
+              if (!prev[orderId]) return prev;
+              const next = { ...prev };
+              delete next[orderId];
+              return next;
+            });
+          }
+        });
+    },
+    [cloudSyncEmail, onLoadCloudReceipt],
+  );
 
   useEffect(() => {
     if (!cloudSyncEmail) return;
-    let cancelled = false;
     for (const order of orders.slice(0, 60)) {
       if (
         order.hasPaymentScreenshot &&
         !order.paymentScreenshot &&
         !cloudReceipts[order.order_id] &&
-        !cloudReceiptChecked[order.order_id] &&
+        !checkedReceiptsRef.current.has(order.order_id) &&
         !inFlightReceiptsRef.current.has(order.order_id)
       ) {
-        inFlightReceiptsRef.current.add(order.order_id);
-        setLoadingReceipts((prev) => ({ ...prev, [order.order_id]: true }));
-        void onLoadCloudReceipt(order.order_id)
-          .then((dataUrl) => {
-            if (cancelled) return;
-            if (dataUrl) {
-              setCloudReceipts((prev) =>
-                prev[order.order_id] === dataUrl ? prev : { ...prev, [order.order_id]: dataUrl },
-              );
-            }
-            setCloudReceiptChecked((prev) => ({ ...prev, [order.order_id]: true }));
-          })
-          .finally(() => {
-            inFlightReceiptsRef.current.delete(order.order_id);
-            if (!cancelled) {
-              setLoadingReceipts((prev) => {
-                if (!prev[order.order_id]) return prev;
-                const next = { ...prev };
-                delete next[order.order_id];
-                return next;
-              });
-            }
-          });
+        loadCloudReceiptForOrder(order.order_id, true);
       }
     }
-    return () => {
-      cancelled = true;
-    };
-  }, [cloudReceiptChecked, cloudReceipts, cloudSyncEmail, onLoadCloudReceipt, orders]);
+  }, [cloudReceipts, cloudSyncEmail, loadCloudReceiptForOrder, orders]);
 
   const inProgressCount = orders.filter((o) => {
     const s = o.status.toLowerCase();
@@ -377,10 +417,14 @@ export function AdminView({
                 {(() => {
                   const isLoadingCloudReceipt = Boolean(loadingReceipts[order.order_id]);
                   const directReceipt = order.paymentScreenshot || cloudReceipts[order.order_id];
-                  const screenshotSrc =
-                    directReceipt ||
-                    (cloudSyncEmail && isLoadingCloudReceipt ? '' : order.screenshotUrl || '');
-                  if (!screenshotSrc && !isLoadingCloudReceipt) return null;
+                  const serverImgUrl =
+                    order.screenshotUrl && !failedServerImgIds[order.order_id]
+                      ? appendAdminTokenToUrl(order.screenshotUrl, adminToken)
+                      : '';
+                  const screenshotSrc = directReceipt || serverImgUrl;
+                  if (!screenshotSrc && !isLoadingCloudReceipt && !order.hasPaymentScreenshot) {
+                    return null;
+                  }
                   return (
                     <div className="mt-2 bg-[#f8f5ff] border border-[#e9dffc] rounded-[12px] p-2">
                       <div className="flex items-center justify-between mb-1.5">
@@ -409,24 +453,44 @@ export function AdminView({
                             alt={`Payment screenshot for order #${order.id}`}
                             loading="lazy"
                             onError={() => {
-                              if (cloudSyncEmail && !cloudReceipts[order.order_id]) {
-                                void onLoadCloudReceipt(order.order_id).then((dataUrl) => {
-                                  if (dataUrl) {
-                                    setCloudReceipts((prev) => ({
-                                      ...prev,
-                                      [order.order_id]: dataUrl,
-                                    }));
-                                  }
-                                });
+                              if (!directReceipt) {
+                                setFailedServerImgIds((prev) =>
+                                  prev[order.order_id]
+                                    ? prev
+                                    : { ...prev, [order.order_id]: true },
+                                );
+                                if (cloudSyncEmail) {
+                                  checkedReceiptsRef.current.delete(order.order_id);
+                                  loadCloudReceiptForOrder(order.order_id, true);
+                                }
                               }
                             }}
                             className="w-full max-h-44 object-contain rounded-[8px] bg-white border border-[#e9dffc]"
                           />
                         </button>
-                      ) : (
+                      ) : isLoadingCloudReceipt ? (
                         <div className="w-full h-24 rounded-[8px] bg-white border border-[#e9dffc] flex items-center justify-center text-[12px] font-bold text-[#7c4dff]">
                           Loading Payment Screenshot...
                         </div>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (cloudSyncEmail) {
+                              checkedReceiptsRef.current.delete(order.order_id);
+                              loadCloudReceiptForOrder(order.order_id, false);
+                            } else {
+                              setFailedServerImgIds((prev) => {
+                                const next = { ...prev };
+                                delete next[order.order_id];
+                                return next;
+                              });
+                            }
+                          }}
+                          className="w-full h-20 rounded-[8px] bg-white border border-[#e9dffc] flex items-center justify-center text-[12px] font-bold text-[#7c4dff] cursor-pointer hover:bg-[#f3edff]"
+                        >
+                          Tap to reload Payment Screenshot 🔄
+                        </button>
                       )}
                     </div>
                   );

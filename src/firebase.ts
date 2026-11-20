@@ -105,6 +105,13 @@ export async function signInAdminGoogle(): Promise<{
         message: `Domain "${window.location.hostname}" Firebase Authorized Domains me add karein ❌`,
       };
     }
+    if (code === 'auth/popup-blocked') {
+      return {
+        ok: false,
+        code,
+        message: 'Browser ne Google popup block kiya — popup allow karke dobara Connect Google dabaye ❌',
+      };
+    }
     if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
       return { ok: false, code, message: 'Google Sign-In cancel ho gaya' };
     }

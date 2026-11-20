@@ -17,9 +17,10 @@ import type { ServiceCatalogOverrideItem } from './panelLogic';
 import { db, handleFirestoreError, OperationType } from '../firebase';
 
 export const FIRESTORE_ORDER_ID_RE = /^ORD[0-9]{10,16}_[a-zA-Z0-9]{8,32}$/;
-const MAX_RECEIPT_CHARS = 550_000;
+const MAX_RECEIPT_CHARS = 320_000;
 const MAX_ALERTS_PER_ORDER = 25;
-const FIRESTORE_OP_TIMEOUT_MS = 4500;
+const FIRESTORE_OP_TIMEOUT_MS = 8000;
+const FIRESTORE_CREATE_TIMEOUT_MS = 10_000;
 
 function withTimeout<T>(promise: Promise<T>, ms = FIRESTORE_OP_TIMEOUT_MS): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -107,13 +108,33 @@ function sanitizeAlertList(raw: unknown): FirestoreOrderAlert[] {
   return out;
 }
 
+function normalizeImageDataUrl(raw: string): string {
+  const trimmed = raw.trim();
+  return trimmed.replace(
+    /^data:image\/(png|jpeg|jpg|webp);base64,/i,
+    (_, ext: string) => `data:image/${ext.toLowerCase()};base64,`,
+  );
+}
+
+function isValidReceiptDataUrl(url: string): boolean {
+  return (
+    url.length >= 40 &&
+    url.length <= MAX_RECEIPT_CHARS &&
+    (url.startsWith('data:image/png;base64,') ||
+      url.startsWith('data:image/jpeg;base64,') ||
+      url.startsWith('data:image/jpg;base64,') ||
+      url.startsWith('data:image/webp;base64,'))
+  );
+}
+
 function shrinkScreenshotIfNeeded(dataUrl: string): Promise<string> {
-  if (dataUrl.length <= MAX_RECEIPT_CHARS) {
-    return Promise.resolve(dataUrl);
+  const normalized = normalizeImageDataUrl(dataUrl);
+  if (isValidReceiptDataUrl(normalized)) {
+    return Promise.resolve(normalized);
   }
   return new Promise((resolve) => {
     const img = new Image();
-    img.onerror = () => resolve(dataUrl.slice(0, MAX_RECEIPT_CHARS));
+    img.onerror = () => resolve(normalized);
     img.onload = () => {
       const maxDim = 720;
       let { width, height } = img;
@@ -127,19 +148,48 @@ function shrinkScreenshotIfNeeded(dataUrl: string): Promise<string> {
       canvas.height = height;
       const ctx = canvas.getContext('2d');
       if (!ctx) {
-        resolve(dataUrl.slice(0, MAX_RECEIPT_CHARS));
+        resolve(normalized);
         return;
       }
       ctx.drawImage(img, 0, 0, width, height);
-      const q70 = canvas.toDataURL('image/jpeg', 0.68);
-      if (q70.length <= MAX_RECEIPT_CHARS) {
-        resolve(q70);
+      for (const quality of [0.72, 0.5, 0.35]) {
+        const candidate = normalizeImageDataUrl(canvas.toDataURL('image/jpeg', quality));
+        if (candidate.length <= MAX_RECEIPT_CHARS) {
+          resolve(candidate);
+          return;
+        }
+      }
+      // Final smaller dimension pass for extremely dense screenshots
+      const smallCanvas = document.createElement('canvas');
+      smallCanvas.width = Math.max(1, Math.round(width * 0.65));
+      smallCanvas.height = Math.max(1, Math.round(height * 0.65));
+      const smallCtx = smallCanvas.getContext('2d');
+      if (!smallCtx) {
+        resolve(normalizeImageDataUrl(canvas.toDataURL('image/jpeg', 0.35)));
         return;
       }
-      resolve(canvas.toDataURL('image/jpeg', 0.45));
+      smallCtx.drawImage(img, 0, 0, smallCanvas.width, smallCanvas.height);
+      resolve(normalizeImageDataUrl(smallCanvas.toDataURL('image/jpeg', 0.45)));
     };
-    img.src = dataUrl;
+    img.src = normalized;
   });
+}
+
+async function fetchUrlAsDataUrl(url: string): Promise<string> {
+  try {
+    const res = await fetch(url, { credentials: 'same-origin' });
+    if (!res.ok) return '';
+    const blob = await res.blob();
+    if (!blob.type.startsWith('image/')) return '';
+    return await new Promise<string>((resolve) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : '');
+      reader.onerror = () => resolve('');
+      reader.readAsDataURL(blob);
+    });
+  } catch {
+    return '';
+  }
 }
 
 export function firestoreDocToOrderItem(raw: Partial<FirestoreOrderDoc>): OrderItem | null {
@@ -195,10 +245,7 @@ export async function createOrderInFirestore(
   const orderPath = `orders/${order.order_id}`;
   try {
     const receiptStr = paymentScreenshot ? await shrinkScreenshotIfNeeded(paymentScreenshot) : '';
-    const hasReceipt =
-      receiptStr.length >= 40 &&
-      receiptStr.length <= MAX_RECEIPT_CHARS &&
-      /^data:image\/(png|jpeg|jpg|webp);base64,/i.test(receiptStr);
+    const hasReceipt = isValidReceiptDataUrl(receiptStr);
 
     const docPayload = {
       id: Math.max(1, Math.floor(order.id || 1)),
@@ -222,21 +269,45 @@ export async function createOrderInFirestore(
       serverUpdatedAt: serverTimestamp(),
     };
 
-    // Commit order + isolated payment receipt atomically in a single batch so Admin phones
-    // immediately have the screenshot available the instant onSnapshot delivers the order.
-    const batch = writeBatch(db);
-    batch.set(doc(db, 'orders', order.order_id), docPayload);
+    const receiptPayload = hasReceipt
+      ? {
+          order_id: order.order_id,
+          uid: clampString(order.uid, 16),
+          paymentScreenshot: receiptStr,
+          serverCreatedAt: serverTimestamp(),
+        }
+      : null;
+
     if (hasReceipt) {
       receiptCache.set(order.order_id, receiptStr);
-      batch.set(doc(db, 'order_receipts', order.order_id), {
-        order_id: order.order_id,
-        uid: clampString(order.uid, 16),
-        paymentScreenshot: receiptStr,
-        serverCreatedAt: serverTimestamp(),
-      });
     }
-    await withTimeout(batch.commit());
-    return true;
+
+    // Commit order + isolated payment receipt atomically in a single batch so Admin phones
+    // immediately have the screenshot available the instant onSnapshot delivers the order.
+    try {
+      const batch = writeBatch(db);
+      batch.set(doc(db, 'orders', order.order_id), docPayload);
+      if (receiptPayload) {
+        batch.set(doc(db, 'order_receipts', order.order_id), receiptPayload);
+      }
+      await withTimeout(batch.commit(), FIRESTORE_CREATE_TIMEOUT_MS);
+      return true;
+    } catch (batchErr) {
+      if (isTimeoutError(batchErr)) return false;
+      // Fallback: write order doc first, then receipt doc separately so the live order is never lost
+      await withTimeout(setDoc(doc(db, 'orders', order.order_id), docPayload), FIRESTORE_CREATE_TIMEOUT_MS);
+      if (receiptPayload) {
+        try {
+          await withTimeout(
+            setDoc(doc(db, 'order_receipts', order.order_id), receiptPayload),
+            FIRESTORE_CREATE_TIMEOUT_MS,
+          );
+        } catch {
+          // Order itself is safely synced live even if receipt write failed
+        }
+      }
+      return true;
+    }
   } catch (error) {
     if (isTimeoutError(error)) return false;
     try {
@@ -250,22 +321,27 @@ export async function createOrderInFirestore(
 export async function backfillLocalOrdersToFirestore(
   localOrders: OrderItem[],
   existingCloudIds: Set<string>,
+  adminToken?: string,
 ): Promise<void> {
   for (const order of localOrders.slice(0, 40)) {
     if (!isValidFirestoreOrderId(order.order_id)) continue;
     if (existingCloudIds.has(order.order_id)) continue;
     try {
       const orderRef = doc(db, 'orders', order.order_id);
-      const existingSnap = await getDoc(orderRef);
+      const existingSnap = await withTimeout(getDoc(orderRef));
       if (existingSnap.exists()) continue;
 
-      const receiptStr = order.paymentScreenshot
-        ? await shrinkScreenshotIfNeeded(order.paymentScreenshot)
-        : '';
-      const hasReceipt =
-        receiptStr.length >= 40 &&
-        receiptStr.length <= MAX_RECEIPT_CHARS &&
-        /^data:image\/(png|jpeg|jpg|webp);base64,/i.test(receiptStr);
+      let rawReceipt = order.paymentScreenshot || '';
+      if (!rawReceipt && order.screenshotUrl) {
+        const urlWithToken =
+          adminToken && !order.screenshotUrl.includes('adminToken=')
+            ? `${order.screenshotUrl}${order.screenshotUrl.includes('?') ? '&' : '?'}adminToken=${encodeURIComponent(adminToken)}`
+            : order.screenshotUrl;
+        rawReceipt = await fetchUrlAsDataUrl(urlWithToken);
+      }
+
+      const receiptStr = rawReceipt ? await shrinkScreenshotIfNeeded(rawReceipt) : '';
+      const hasReceipt = isValidReceiptDataUrl(receiptStr);
 
       const status = normalizeStatus(order.status);
       const batch = writeBatch(db);
@@ -299,7 +375,7 @@ export async function backfillLocalOrdersToFirestore(
           serverCreatedAt: serverTimestamp(),
         });
       }
-      await batch.commit();
+      await withTimeout(batch.commit(), FIRESTORE_CREATE_TIMEOUT_MS);
     } catch {
       // Skip individual backfill errors without interrupting live sync
     }

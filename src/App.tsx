@@ -71,6 +71,7 @@ interface NavHistoryState {
 }
 
 const STORAGE_USER_TOKEN_KEY = 'tp_user_session_v2';
+const STORAGE_ADMIN_TOKEN_KEY = 'tp_admin_token_v1';
 const STORAGE_ORDERS_CACHE_KEY = 'tp_orders_cache_v2';
 const STORAGE_NOTIFS_CACHE_KEY = 'tp_notifs_cache_v2';
 const STORAGE_ADMIN_ORDERS_CACHE_KEY = 'tp_admin_orders_cache_v2';
@@ -82,6 +83,35 @@ const STORAGE_LIVE_CATALOG_TOKEN_KEY = 'tp_live_catalog_token_v1';
 const STORAGE_LIVE_POSTER_KEY = 'tp_live_poster_v1';
 const STORAGE_LIVE_POSTER_UPDATED_AT_KEY = 'tp_live_poster_ts_v1';
 const LIVE_CHANNEL_NAME = 'trustedpanel_live_sync_v1';
+
+function readSavedAdminToken(): string {
+  try {
+    return sessionStorage.getItem(STORAGE_ADMIN_TOKEN_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
+function saveAdminToken(token: string): void {
+  try {
+    if (token) {
+      sessionStorage.setItem(STORAGE_ADMIN_TOKEN_KEY, token);
+    } else {
+      sessionStorage.removeItem(STORAGE_ADMIN_TOKEN_KEY);
+    }
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+function serializeAdminOrdersSignature(list: OrderItem[]): string {
+  return list
+    .map(
+      (o) =>
+        `${o.order_id}|${o.status}|${o.statusUpdatedAt || 0}|${o.messageUpdatedAt || 0}|${o.adminMessage || ''}|${o.hasPaymentScreenshot ? 1 : 0}|${o.screenshotUrl || ''}`,
+    )
+    .join(';');
+}
 
 function readSavedUserToken(): string {
   try {
@@ -274,11 +304,14 @@ export default function App() {
   );
 
   const [isAdminLoggedIn, setIsAdminLoggedIn] = useState<boolean>(false);
+  const [adminToken, setAdminToken] = useState<string>(readSavedAdminToken);
   const [adminOrders, setAdminOrders] = useState<OrderItem[]>([]);
   const [cloudSyncEmail, setCloudSyncEmail] = useState<string | null>(null);
   const [cloudSyncBusy, setCloudSyncBusy] = useState<boolean>(false);
   const [cloudSyncError, setCloudSyncError] = useState<string | null>(null);
   const cloudSyncActiveRef = useRef<boolean>(false);
+  const adminTokenRef = useRef<string>(adminToken);
+  const adminOrdersSigRef = useRef<string>('');
 
   const [activePage, setActivePage] = useState<ActivePage>(() => {
     const parsed = parseHashPage(window.location.hash);
@@ -344,8 +377,24 @@ export default function App() {
   }, [uid]);
 
   useEffect(() => {
+    adminTokenRef.current = adminToken;
+  }, [adminToken]);
+
+  useEffect(() => {
     adminOrdersRef.current = adminOrders;
+    adminOrdersSigRef.current = serializeAdminOrdersSignature(adminOrders);
   }, [adminOrders]);
+
+  const getAdminHeaders = useCallback(
+    (extra?: Record<string, string>): Record<string, string> => {
+      const headers: Record<string, string> = { ...(extra ?? {}) };
+      if (adminTokenRef.current) {
+        headers['x-admin-token'] = adminTokenRef.current;
+      }
+      return headers;
+    },
+    [],
+  );
 
   const showToast = useCallback((message: string, isError = false) => {
     if (toastTimerRef.current !== null) {
@@ -381,12 +430,20 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
-  // Verify admin HttpOnly cookie session on mount
+  // Verify admin session on mount (cookie or sessionStorage adminToken fallback)
   useEffect(() => {
-    fetch('/api/admin/session', { credentials: 'same-origin' })
+    fetch('/api/admin/session', {
+      credentials: 'same-origin',
+      headers: getAdminHeaders(),
+    })
       .then((res) => (res.ok ? res.json() : null))
-      .then((data: { ok?: boolean; authenticated?: boolean } | null) => {
+      .then((data: { ok?: boolean; authenticated?: boolean; adminToken?: string } | null) => {
         if (data?.ok && data.authenticated) {
+          if (typeof data.adminToken === 'string' && data.adminToken) {
+            adminTokenRef.current = data.adminToken;
+            setAdminToken(data.adminToken);
+            saveAdminToken(data.adminToken);
+          }
           setIsAdminLoggedIn(true);
           if (initialHashPageRef.current === 'admin') {
             setActivePage('admin');
@@ -403,7 +460,7 @@ export default function App() {
         }
       })
       .catch(() => {});
-  }, []);
+  }, [getAdminHeaders]);
 
   // Initialize history state cleanly on mount so phone Back moves exactly 1 step per press
   useEffect(() => {
@@ -748,7 +805,7 @@ export default function App() {
             void fetch('/api/admin/catalog', {
               method: 'POST',
               credentials: 'same-origin',
-              headers: { 'Content-Type': 'application/json' },
+              headers: getAdminHeaders({ 'Content-Type': 'application/json' }),
               body: JSON.stringify({
                 catalog: toCatalogOverridePayload(liveCatalogRef.current),
                 clientUpdatedAt: localCatalogTs,
@@ -771,7 +828,7 @@ export default function App() {
             void fetch('/api/admin/poster', {
               method: 'POST',
               credentials: 'same-origin',
-              headers: { 'Content-Type': 'application/json' },
+              headers: getAdminHeaders({ 'Content-Type': 'application/json' }),
               body: JSON.stringify(
                 livePosterRef.current
                   ? { posterImage: livePosterRef.current, clientUpdatedAt: localPosterTs }
@@ -982,6 +1039,7 @@ export default function App() {
         const res = await fetch('/api/admin/overview', {
           credentials: 'same-origin',
           cache: 'no-store',
+          headers: getAdminHeaders(),
         });
         if (reqSeq !== adminSyncSeqRef.current) return;
         if (res.status === 401) {
@@ -1008,7 +1066,8 @@ export default function App() {
         const statusOverrides = readAdminStatusOverrides();
         const merged = mergeAdminOrders({
           serverOrders: incomingOrders,
-          cachedOrders: readCachedAdminOrders(),
+          cachedOrders:
+            adminOrdersRef.current.length > 0 ? adminOrdersRef.current : readCachedAdminOrders(),
           deletedIds,
           statusOverrides,
         });
@@ -1031,15 +1090,19 @@ export default function App() {
           }
         }
 
-        saveCachedAdminOrders(merged);
-        setAdminOrders(merged);
+        const nextSig = serializeAdminOrdersSignature(merged);
+        if (nextSig !== adminOrdersSigRef.current || isInitialPoll) {
+          adminOrdersSigRef.current = nextSig;
+          saveCachedAdminOrders(merged);
+          setAdminOrders(merged);
+        }
       } catch {
         // Keep cached orders visible during transient network hiccups
       } finally {
         adminSyncInFlightRef.current = false;
       }
     },
-    [isAdminLoggedIn, showToast],
+    [getAdminHeaders, isAdminLoggedIn, showToast],
   );
 
   // Instant Admin hydration, SSE live push with full order payload, and fast non-overlapping 800ms fallback polling
@@ -1068,7 +1131,10 @@ export default function App() {
 
     let es: EventSource | null = null;
     if (typeof EventSource !== 'undefined') {
-      es = new EventSource('/api/admin/events');
+      const sseUrl = adminTokenRef.current
+        ? `/api/admin/events?adminToken=${encodeURIComponent(adminTokenRef.current)}`
+        : '/api/admin/events';
+      es = new EventSource(sseUrl);
       const onNewOrder = (evt: Event) => {
         const msgEvt = evt as MessageEvent<string>;
         if (msgEvt.data) {
@@ -1133,7 +1199,7 @@ export default function App() {
       window.clearInterval(timer);
       if (es) es.close();
     };
-  }, [applyLiveAdminOrderPush, isAdminLoggedIn, syncAdminOverview, syncLiveCatalog]);
+  }, [adminToken, applyLiveAdminOrderPush, isAdminLoggedIn, syncAdminOverview, syncLiveCatalog]);
 
   // Real-time Firestore cloud subscription for Admin Panel (all old orders on new phone + simultaneous push to all 2-3 Admin phones)
   useEffect(() => {
@@ -1165,11 +1231,11 @@ export default function App() {
               knownAdminOrderIdsRef.current.add(o.order_id);
             }
           }
-          // Backfill any local-only orders from this phone into Firestore so other phones see them too
+          // Backfill any local-only orders (with their screenshots) from this phone into Firestore
           const cloudIds = new Set([...cloudOrders.map((o) => o.order_id), ...hiddenIds]);
           const localOnly = merged.filter((o) => !cloudIds.has(o.order_id));
           if (localOnly.length > 0) {
-            void backfillLocalOrdersToFirestore(localOnly, cloudIds);
+            void backfillLocalOrdersToFirestore(localOnly, cloudIds, adminTokenRef.current);
           }
         } else {
           if (knownAdminOrderIdsRef.current === null) {
@@ -1533,10 +1599,19 @@ export default function App() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ password }),
         });
-        const data = (await res.json()) as { ok?: boolean; message?: string };
+        const data = (await res.json()) as {
+          ok?: boolean;
+          adminToken?: string;
+          message?: string;
+        };
         if (!res.ok || !data.ok) {
           showToast(data.message || 'Wrong Password ❌', true);
           return false;
+        }
+        if (typeof data.adminToken === 'string' && data.adminToken) {
+          adminTokenRef.current = data.adminToken;
+          setAdminToken(data.adminToken);
+          saveAdminToken(data.adminToken);
         }
       } catch {
         showToast('Network Error ❌', true);
@@ -1575,10 +1650,14 @@ export default function App() {
       await fetch('/api/admin/logout', {
         method: 'POST',
         credentials: 'same-origin',
+        headers: getAdminHeaders(),
       });
     } catch {
       // Ignore logout error
     }
+    adminTokenRef.current = '';
+    setAdminToken('');
+    saveAdminToken('');
     setIsAdminLoggedIn(false);
     setAdminOrders([]);
     showToast('Admin Logged Out');
@@ -1588,7 +1667,7 @@ export default function App() {
       serviceId: null,
       modal: null,
     });
-  }, [currentCategory, pushNavState, showToast]);
+  }, [currentCategory, getAdminHeaders, pushNavState, showToast]);
 
   const handleConnectCloudSync = useCallback(async () => {
     playClickSound();
@@ -1681,7 +1760,7 @@ export default function App() {
         const apiPromise = fetch('/api/admin/order-status', {
           method: 'POST',
           credentials: 'same-origin',
-          headers: { 'Content-Type': 'application/json' },
+          headers: getAdminHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({ order_id: orderId, status, note, orderSnapshot }),
         })
           .then(async (res) => {
@@ -1755,7 +1834,14 @@ export default function App() {
         showToast('Network Error ❌', true);
       }
     },
-    [applyLiveAdminOrderPush, applyLiveCustomerPush, showToast, syncAdminOverview, syncUserState],
+    [
+      applyLiveAdminOrderPush,
+      applyLiveCustomerPush,
+      getAdminHeaders,
+      showToast,
+      syncAdminOverview,
+      syncUserState,
+    ],
   );
 
   const handleAdminDeleteOrder = useCallback(
@@ -1767,6 +1853,7 @@ export default function App() {
           fetch(`/api/admin/orders/${encodeURIComponent(orderId)}`, {
             method: 'DELETE',
             credentials: 'same-origin',
+            headers: getAdminHeaders(),
           })
             .then((r) => r.ok)
             .catch(() => false),
@@ -1794,7 +1881,7 @@ export default function App() {
         showToast('Network Error ❌', true);
       }
     },
-    [showToast],
+    [getAdminHeaders, showToast],
   );
 
   const handleAdminSendMessage = useCallback(
@@ -1813,7 +1900,7 @@ export default function App() {
         const apiPromise = fetch('/api/admin/order-message', {
           method: 'POST',
           credentials: 'same-origin',
-          headers: { 'Content-Type': 'application/json' },
+          headers: getAdminHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({ order_id: orderId, message, orderSnapshot }),
         })
           .then(async (res) => {
@@ -1907,7 +1994,7 @@ export default function App() {
         const res = await fetch('/api/admin/catalog', {
           method: 'POST',
           credentials: 'same-origin',
-          headers: { 'Content-Type': 'application/json' },
+          headers: getAdminHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({ catalog: payload, clientUpdatedAt: optimisticTs }),
         });
         const data = (await res.json()) as {
@@ -1954,7 +2041,7 @@ export default function App() {
         return false;
       }
     },
-    [showToast],
+    [getAdminHeaders, showToast],
   );
 
   const handleAdminResetCatalog = useCallback(async (): Promise<boolean> => {
@@ -1965,7 +2052,7 @@ export default function App() {
       const res = await fetch('/api/admin/catalog', {
         method: 'POST',
         credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAdminHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ reset: true, clientUpdatedAt: optimisticTs }),
       });
       const data = (await res.json()) as {
@@ -2009,7 +2096,7 @@ export default function App() {
       showToast('Network Error ❌', true);
       return false;
     }
-  }, [showToast]);
+  }, [getAdminHeaders, showToast]);
 
   const handleAdminSavePoster = useCallback(
     async (posterDataUrl: string | null): Promise<boolean> => {
@@ -2017,7 +2104,7 @@ export default function App() {
       catalogSyncSeqRef.current += 1;
       const optimisticTs = Math.max(Date.now(), posterUpdatedAtRef.current + 1);
       try {
-        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        const headers = getAdminHeaders({ 'Content-Type': 'application/json' });
         if (catalogTokenRef.current) {
           headers['x-catalog-token'] = catalogTokenRef.current;
         }
@@ -2206,6 +2293,7 @@ export default function App() {
             cloudSyncEmail={cloudSyncEmail}
             cloudSyncBusy={cloudSyncBusy}
             cloudSyncError={cloudSyncError}
+            adminToken={adminToken}
             onConnectCloudSync={handleConnectCloudSync}
             onDisconnectCloudSync={handleDisconnectCloudSync}
             onLoadCloudReceipt={fetchOrderReceiptFromFirestore}

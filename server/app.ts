@@ -11,9 +11,7 @@ const __dirname = path.dirname(__filename);
 const ADMIN_PASS = process.env.ADMIN_PASSWORD || 'banti&1945';
 const UPI_ID = process.env.UPI_ID || 'skiend@axl';
 const UPI_PAYEE_NAME = process.env.UPI_PAYEE_NAME || 'TrustedPanel';
-const FIREBASE_RTDB_URL =
-  process.env.FIREBASE_RTDB_URL ||
-  'https://trusted-91b2d-default-rtdb.asia-southeast1.firebasedatabase.app';
+const FIREBASE_RTDB_URL = (process.env.FIREBASE_RTDB_URL || '').trim().replace(/\/+$/, '');
 const FIREBASE_RTDB_AUTH = process.env.FIREBASE_RTDB_AUTH || '';
 const KV_REST_API_URL =
   process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL || '';
@@ -24,7 +22,7 @@ const SESSION_SECRET = process.env.SESSION_SECRET
   ? crypto.createHash('sha256').update(process.env.SESSION_SECRET).digest()
   : crypto
       .createHash('sha256')
-      .update(`${ADMIN_PASS}|tp-hmac-v2|${FIREBASE_RTDB_URL}`)
+      .update(`${ADMIN_PASS}|tp-hmac-v2|trustedpanel`)
       .digest();
 
 const DATA_DIR =
@@ -473,7 +471,7 @@ function buildFirebaseUrl(subPath: string): string {
 let firebaseBlockedUntilMs = 0;
 
 async function syncToFirebase(subPath: string, payload: unknown): Promise<void> {
-  if (Date.now() < firebaseBlockedUntilMs) return;
+  if (!FIREBASE_RTDB_URL || Date.now() < firebaseBlockedUntilMs) return;
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 1800);
@@ -493,7 +491,7 @@ async function syncToFirebase(subPath: string, payload: unknown): Promise<void> 
 }
 
 async function readFromFirebase<T>(subPath: string): Promise<T | null> {
-  if (Date.now() < firebaseBlockedUntilMs) return null;
+  if (!FIREBASE_RTDB_URL || Date.now() < firebaseBlockedUntilMs) return null;
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 1600);
@@ -732,10 +730,22 @@ function getOrIssueUserSession(
   return { uid, sid, token };
 }
 
-function isAdminAuthenticated(req: Request): boolean {
+function getVerifiedAdminToken(req: Request): string | null {
   const cookies = parseCookies(req);
-  const verified = verifyToken<{ role?: string }>(cookies[ADMIN_COOKIE]);
-  return verified?.role === 'admin';
+  const cookieToken = cookies[ADMIN_COOKIE];
+  const headerToken =
+    typeof req.headers['x-admin-token'] === 'string' ? req.headers['x-admin-token'] : '';
+  const queryToken = typeof req.query?.adminToken === 'string' ? req.query.adminToken : '';
+  for (const candidate of [cookieToken, headerToken, queryToken]) {
+    if (!candidate) continue;
+    const verified = verifyToken<{ role?: string }>(candidate);
+    if (verified?.role === 'admin') return candidate;
+  }
+  return null;
+}
+
+function isAdminAuthenticated(req: Request): boolean {
+  return getVerifiedAdminToken(req) !== null;
 }
 
 function sanitizeScreenshotDataUrl(
@@ -1053,7 +1063,7 @@ export function createApiApp() {
   let lastRemoteOrdersSyncMs = 0;
   async function syncOrdersFromRemoteIfStale(): Promise<void> {
     const hasKv = Boolean(KV_REST_API_URL && KV_REST_API_TOKEN);
-    const hasFb = Date.now() >= firebaseBlockedUntilMs;
+    const hasFb = Boolean(FIREBASE_RTDB_URL) && Date.now() >= firebaseBlockedUntilMs;
     if (!hasKv && !hasFb) return;
     const now = Date.now();
     if (now - lastRemoteOrdersSyncMs < 1000) return;
@@ -1481,10 +1491,11 @@ export function createApiApp() {
 
   // Admin session check
   app.get('/api/admin/session', (req, res) => {
-    res.json({ ok: true, authenticated: isAdminAuthenticated(req) });
+    const token = getVerifiedAdminToken(req);
+    res.json({ ok: true, authenticated: token !== null, adminToken: token || undefined });
   });
 
-  // Admin login (timing-safe + HttpOnly cookie + brute-force limit)
+  // Admin login (timing-safe + HttpOnly cookie + signed header/query token fallback for iframes)
   app.post('/api/admin/login', (req, res) => {
     pruneTokens();
     const ip = String(req.headers['x-forwarded-for'] || req.ip || 'unknown').split(',')[0].trim();
@@ -1509,7 +1520,7 @@ export function createApiApp() {
       exp: Date.now() + 1000 * 60 * 60 * 12,
     });
     setSessionCookie(res, req, ADMIN_COOKIE, adminToken, 60 * 60 * 12);
-    res.json({ ok: true });
+    res.json({ ok: true, adminToken });
   });
 
   app.post('/api/admin/logout', (req, res) => {
