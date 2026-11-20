@@ -8,6 +8,8 @@ import {
   generateUserId,
   getOrderStatusBadgeStyle,
   mergeAdminOrders,
+  mergeCustomerNotifications,
+  mergeCustomerOrders,
   mergeLiveCatalog,
   parseHashPage,
   reconcileCatalogDrafts,
@@ -385,4 +387,107 @@ test('reconcileCatalogDrafts preserves unsaved Admin edits while syncing clean s
   assert.equal(dirtyReels?.name, 'Typing New Name...');
   assert.equal(dirtyReels?.prices[0].p, '9');
   assert.equal(cleanBlueTik?.name, 'UPDATED SERVER NAME');
+});
+
+test('mergeCustomerOrders never reverts newer status or adminMessage on stale poll', () => {
+  const cached = [
+    {
+      id: 1,
+      order_id: 'ORD_C1',
+      service: '1rs = 1k Reels Views',
+      pack: '1K Reels Views',
+      price: 1,
+      amount: 1,
+      link: 'https://instagram.com/reel/abc',
+      status: 'payment_failed',
+      adminMessage: 'Payment screenshot unclear, resend karo',
+      statusUpdatedAt: 5000,
+      messageUpdatedAt: 6000,
+      date: 'd',
+      createdAt: 1000,
+      uid: 'TRUST-1111',
+    },
+  ];
+  const staleServer = [
+    {
+      id: 1,
+      order_id: 'ORD_C1',
+      service: '1rs = 1k Reels Views',
+      pack: '1K Reels Views',
+      price: 1,
+      amount: 1,
+      link: 'https://instagram.com/reel/abc',
+      status: 'pending',
+      date: 'd',
+      createdAt: 1000,
+      uid: 'TRUST-1111',
+    },
+  ];
+  const merged = mergeCustomerOrders({
+    serverOrders: staleServer,
+    cachedOrders: cached,
+    uid: 'TRUST-1111',
+  });
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0].status, 'payment_failed');
+  assert.equal(merged[0].adminMessage, 'Payment screenshot unclear, resend karo');
+
+  // Newer explicit status update from server takes effect immediately
+  const newerServer = [
+    {
+      ...staleServer[0],
+      status: 'successful',
+      adminMessage: 'Order #1 Successful ✅',
+      statusUpdatedAt: 7000,
+      messageUpdatedAt: 7000,
+    },
+  ];
+  const updated = mergeCustomerOrders({
+    serverOrders: newerServer,
+    cachedOrders: merged,
+    uid: 'TRUST-1111',
+  });
+  assert.equal(updated[0].status, 'successful');
+  assert.equal(updated[0].adminMessage, 'Order #1 Successful ✅');
+});
+
+test('mergeCustomerNotifications unions alerts without dropping messages and preserves read state', () => {
+  const cached = [
+    {
+      id: 'N1',
+      orderId: 'ORD1',
+      orderNum: 1,
+      service: 'Reels',
+      pack: '1K',
+      status: 'pending',
+      message: 'Started',
+      date: 'd',
+      createdAt: 100,
+      read: true,
+    },
+    {
+      id: 'N2',
+      orderId: 'ORD1',
+      orderNum: 1,
+      service: 'Reels',
+      pack: '1K',
+      status: 'successful',
+      message: 'Custom Admin Message',
+      date: 'd',
+      createdAt: 200,
+      read: false,
+    },
+  ];
+  const staleServer = [
+    { ...cached[0], read: false },
+  ];
+  const merged = mergeCustomerNotifications({
+    serverNotifications: staleServer,
+    cachedNotifications: cached,
+  });
+  assert.equal(merged.length, 2);
+  assert.equal(merged[0].id, 'N2');
+  assert.equal(merged[0].read, false);
+  assert.equal(merged[1].id, 'N1');
+  assert.equal(merged[1].read, true);
 });

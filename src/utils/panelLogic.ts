@@ -64,14 +64,19 @@ export function mergeAdminOrders(params: {
   const applyOverride = (order: OrderItem): OrderItem => {
     const ov = overrides[order.order_id];
     if (!ov) return order;
-    const serverUpdatedAt = typeof order.statusUpdatedAt === 'number' ? order.statusUpdatedAt : 0;
+    const serverStatusTs = typeof order.statusUpdatedAt === 'number' ? order.statusUpdatedAt : 0;
+    const serverMsgTs = typeof order.messageUpdatedAt === 'number' ? order.messageUpdatedAt : 0;
     // Keep Admin's explicit status locked unless server carries a strictly newer explicit admin update
-    if (serverUpdatedAt <= ov.updatedAt) {
+    if (serverStatusTs <= ov.updatedAt) {
       return {
         ...order,
         status: ov.status,
-        adminMessage: ov.adminMessage ?? order.adminMessage,
-        statusUpdatedAt: Math.max(serverUpdatedAt, ov.updatedAt),
+        adminMessage:
+          serverMsgTs > ov.updatedAt && order.adminMessage
+            ? order.adminMessage
+            : ov.adminMessage ?? order.adminMessage,
+        statusUpdatedAt: Math.max(serverStatusTs, ov.updatedAt),
+        messageUpdatedAt: Math.max(serverMsgTs, ov.updatedAt),
       };
     }
     return order;
@@ -90,6 +95,84 @@ export function mergeAdminOrders(params: {
   return Array.from(byId.values()).sort(
     (a, b) => (b.createdAt || 0) - (a.createdAt || 0) || b.id - a.id,
   );
+}
+
+function getOrderVersionTs(order: OrderItem): number {
+  const s = typeof order.statusUpdatedAt === 'number' ? order.statusUpdatedAt : 0;
+  const m = typeof order.messageUpdatedAt === 'number' ? order.messageUpdatedAt : 0;
+  return Math.max(s, m);
+}
+
+export function mergeCustomerOrders(params: {
+  serverOrders: OrderItem[];
+  cachedOrders: OrderItem[];
+  uid?: string;
+}): OrderItem[] {
+  const byId = new Map<string, OrderItem>();
+
+  for (const cached of params.cachedOrders) {
+    if (!params.uid || cached.uid === params.uid) {
+      byId.set(cached.order_id, cached);
+    }
+  }
+
+  for (const incoming of params.serverOrders) {
+    const prev = byId.get(incoming.order_id);
+    if (!prev) {
+      byId.set(incoming.order_id, incoming);
+      continue;
+    }
+
+    const prevStatusTs = typeof prev.statusUpdatedAt === 'number' ? prev.statusUpdatedAt : 0;
+    const incStatusTs = typeof incoming.statusUpdatedAt === 'number' ? incoming.statusUpdatedAt : 0;
+    const prevMsgTs = typeof prev.messageUpdatedAt === 'number' ? prev.messageUpdatedAt : prevStatusTs;
+    const incMsgTs = typeof incoming.messageUpdatedAt === 'number' ? incoming.messageUpdatedAt : incStatusTs;
+
+    const useIncomingStatus = incStatusTs >= prevStatusTs;
+    const useIncomingMsg =
+      incMsgTs > prevMsgTs ||
+      (incMsgTs === prevMsgTs && Boolean(incoming.adminMessage || !prev.adminMessage));
+
+    const prevVer = getOrderVersionTs(prev);
+    const incVer = getOrderVersionTs(incoming);
+
+    byId.set(incoming.order_id, {
+      ...(incVer >= prevVer ? incoming : prev),
+      status: useIncomingStatus ? incoming.status : prev.status,
+      statusUpdatedAt: Math.max(prevStatusTs, incStatusTs) || undefined,
+      adminMessage: useIncomingMsg ? incoming.adminMessage : prev.adminMessage,
+      messageUpdatedAt: Math.max(prevMsgTs, incMsgTs) || undefined,
+    });
+  }
+
+  return Array.from(byId.values()).sort(
+    (a, b) => (b.createdAt || 0) - (a.createdAt || 0) || b.id - a.id,
+  );
+}
+
+export function mergeCustomerNotifications(params: {
+  serverNotifications: CustomerNotification[];
+  cachedNotifications: CustomerNotification[];
+  maxItems?: number;
+}): CustomerNotification[] {
+  const byId = new Map<string, CustomerNotification>();
+  for (const n of params.cachedNotifications) {
+    byId.set(n.id, n);
+  }
+  for (const incoming of params.serverNotifications) {
+    const existing = byId.get(incoming.id);
+    if (!existing) {
+      byId.set(incoming.id, incoming);
+    } else {
+      byId.set(incoming.id, {
+        ...incoming,
+        read: existing.read || incoming.read,
+      });
+    }
+  }
+  return Array.from(byId.values())
+    .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+    .slice(0, params.maxItems ?? 50);
 }
 
 export function countUnreadNotifications(notifications: CustomerNotification[]): number {

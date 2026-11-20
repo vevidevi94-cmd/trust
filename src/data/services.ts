@@ -45,9 +45,11 @@ export interface OrderItem {
   date: string;
   createdAt: number;
   statusUpdatedAt?: number;
+  messageUpdatedAt?: number;
   uid: string;
   app?: string;
   paymentScreenshot?: string;
+  screenshotUrl?: string;
   hasPaymentScreenshot?: boolean;
 }
 

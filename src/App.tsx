@@ -13,6 +13,8 @@ import {
   countUnreadNotifications,
   detectNewOrderIds,
   mergeAdminOrders,
+  mergeCustomerNotifications,
+  mergeCustomerOrders,
   mergeLiveCatalog,
   parseHashPage,
   shouldAdoptServerVersion,
@@ -285,6 +287,11 @@ export default function App() {
   const historyDepthRef = useRef<number>(0);
   const initialHashPageRef = useRef<ActivePage>(parseHashPage(window.location.hash));
   const adminSyncSeqRef = useRef<number>(0);
+  const adminSyncInFlightRef = useRef<boolean>(false);
+  const userSyncInFlightRef = useRef<boolean>(false);
+  const userTokenRef = useRef<string>(userToken);
+  const uidRef = useRef<string>(uid);
+  const adminOrdersRef = useRef<OrderItem[]>(adminOrders);
   const catalogSyncSeqRef = useRef<number>(0);
   const catalogUpdatedAtRef = useRef<number>(
     readCachedTimestamp(STORAGE_LIVE_CATALOG_UPDATED_AT_KEY),
@@ -302,6 +309,18 @@ export default function App() {
   useEffect(() => {
     isAdminLoggedInRef.current = isAdminLoggedIn;
   }, [isAdminLoggedIn]);
+
+  useEffect(() => {
+    userTokenRef.current = userToken;
+  }, [userToken]);
+
+  useEffect(() => {
+    uidRef.current = uid;
+  }, [uid]);
+
+  useEffect(() => {
+    adminOrdersRef.current = adminOrders;
+  }, [adminOrders]);
 
   const showToast = useCallback((message: string, isError = false) => {
     if (toastTimerRef.current !== null) {
@@ -445,20 +464,60 @@ export default function App() {
   const getUserHeaders = useCallback(
     (extra?: Record<string, string>): Record<string, string> => {
       const headers: Record<string, string> = { ...(extra ?? {}) };
-      if (userToken) {
-        headers['x-user-token'] = userToken;
+      if (userTokenRef.current) {
+        headers['x-user-token'] = userTokenRef.current;
       }
       if (catalogTokenRef.current) {
         headers['x-catalog-token'] = catalogTokenRef.current;
       }
       return headers;
     },
-    [userToken],
+    [],
   );
 
-  // Sync customer's live orders and Bell notifications from server
+  // Apply live SSE customer order/notification push immediately without waiting for poll
+  const applyLiveCustomerPush = useCallback(
+    (payload: { order?: OrderItem; notification?: CustomerNotification }) => {
+      if (payload.order) {
+        const pushedOrder = payload.order;
+        setOrders((prev) =>
+          mergeCustomerOrders({
+            serverOrders: [pushedOrder],
+            cachedOrders: prev,
+            uid: uidRef.current !== 'TRUST-...' ? uidRef.current : pushedOrder.uid,
+          }),
+        );
+      }
+      if (payload.notification) {
+        const pushedNotif = payload.notification;
+        if (knownCustomerNotifIdsRef.current === null) {
+          knownCustomerNotifIdsRef.current = new Set();
+        }
+        if (!knownCustomerNotifIdsRef.current.has(pushedNotif.id)) {
+          knownCustomerNotifIdsRef.current.add(pushedNotif.id);
+          if (!pushedNotif.read) {
+            showToast(
+              `🔔 ${pushedNotif.message}`,
+              pushedNotif.status.toLowerCase() === 'payment_failed',
+            );
+          }
+        }
+        setNotifications((prev) =>
+          mergeCustomerNotifications({
+            serverNotifications: [pushedNotif],
+            cachedNotifications: prev,
+          }),
+        );
+      }
+    },
+    [showToast],
+  );
+
+  // Sync customer's live orders and Bell notifications from server (non-overlapping & monotonic)
   const syncUserState = useCallback(
-    async (isInitialPoll = false) => {
+    async (isInitialPoll = false, force = false) => {
+      if (userSyncInFlightRef.current && !force) return;
+      userSyncInFlightRef.current = true;
       try {
         const res = await fetch('/api/user-state', {
           credentials: 'same-origin',
@@ -476,9 +535,11 @@ export default function App() {
         if (!data.ok) return;
 
         if (data.uid) {
+          uidRef.current = data.uid;
           setUid(data.uid);
         }
-        if (data.sessionToken && data.sessionToken !== userToken) {
+        if (data.sessionToken && data.sessionToken !== userTokenRef.current) {
+          userTokenRef.current = data.sessionToken;
           setUserToken(data.sessionToken);
           try {
             localStorage.setItem(STORAGE_USER_TOKEN_KEY, data.sessionToken);
@@ -488,24 +549,13 @@ export default function App() {
         }
 
         if (Array.isArray(data.orders)) {
-          // Merge server orders with local cache so orders persist even across serverless cold restarts
-          setOrders((prev) => {
-            if (data.orders!.length === 0 && prev.length > 0) {
-              return prev;
-            }
-            const byId = new Map<string, OrderItem>();
-            for (const o of data.orders!) {
-              byId.set(o.order_id, o);
-            }
-            for (const cached of prev) {
-              if (!byId.has(cached.order_id) && (!data.uid || cached.uid === data.uid)) {
-                byId.set(cached.order_id, cached);
-              }
-            }
-            return Array.from(byId.values()).sort(
-              (a, b) => (b.createdAt || 0) - (a.createdAt || 0) || b.id - a.id,
-            );
-          });
+          setOrders((prev) =>
+            mergeCustomerOrders({
+              serverOrders: data.orders!,
+              cachedOrders: prev,
+              uid: data.uid,
+            }),
+          );
         }
 
         if (Array.isArray(data.notifications)) {
@@ -527,25 +577,27 @@ export default function App() {
             }
           }
 
-          setNotifications((prev) => {
-            if (data.notifications!.length === 0 && prev.length > 0) {
-              return prev;
-            }
-            return data.notifications!;
-          });
+          setNotifications((prev) =>
+            mergeCustomerNotifications({
+              serverNotifications: data.notifications!,
+              cachedNotifications: prev,
+            }),
+          );
         }
       } catch {
         // Ignore transient network errors during poll
+      } finally {
+        userSyncInFlightRef.current = false;
       }
     },
-    [getUserHeaders, showToast, userToken],
+    [getUserHeaders, showToast],
   );
 
   useEffect(() => {
-    void syncUserState(true);
+    void syncUserState(true, true);
     const timer = window.setInterval(() => {
       void syncUserState(false);
-    }, 1200);
+    }, 1000);
     return () => window.clearInterval(timer);
   }, [syncUserState]);
 
@@ -705,13 +757,25 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [syncLiveCatalog]);
 
-  // Real-time SSE stream for instant Customer Bell notifications & live catalog/poster updates
+  // Real-time SSE stream for instant Customer Bell notifications, My Orders updates & live catalog/poster updates
   useEffect(() => {
     if (typeof EventSource === 'undefined' || !userToken) return;
     const url = `/api/user/events?token=${encodeURIComponent(userToken)}`;
     const es = new EventSource(url);
-    const onNotification = () => {
-      void syncUserState(false);
+    const onNotification = (evt: Event) => {
+      const msgEvt = evt as MessageEvent<string>;
+      if (msgEvt.data) {
+        try {
+          const parsed = JSON.parse(msgEvt.data) as {
+            order?: OrderItem;
+            notification?: CustomerNotification;
+          };
+          applyLiveCustomerPush(parsed);
+        } catch {
+          // Fallback to full sync below
+        }
+      }
+      void syncUserState(false, true);
     };
     const onCatalogUpdate = () => {
       void syncLiveCatalog();
@@ -723,12 +787,43 @@ export default function App() {
       es.removeEventListener('catalog_updated', onCatalogUpdate);
       es.close();
     };
-  }, [syncLiveCatalog, syncUserState, userToken]);
+  }, [applyLiveCustomerPush, syncLiveCatalog, syncUserState, userToken]);
+
+  // Apply live SSE Admin order arrival/update instantaneously (<50ms) without waiting for poll
+  const applyLiveAdminOrderPush = useCallback(
+    (incomingOrder: OrderItem, isNewEvent: boolean) => {
+      const deletedIds = new Set(readAdminDeletedIds());
+      if (deletedIds.has(incomingOrder.order_id)) return;
+      const merged = mergeAdminOrders({
+        serverOrders: [incomingOrder],
+        cachedOrders: adminOrdersRef.current.length > 0 ? adminOrdersRef.current : readCachedAdminOrders(),
+        deletedIds,
+        statusOverrides: readAdminStatusOverrides(),
+      });
+      if (isNewEvent) {
+        if (knownAdminOrderIdsRef.current === null) {
+          knownAdminOrderIdsRef.current = new Set();
+        }
+        if (!knownAdminOrderIdsRef.current.has(incomingOrder.order_id)) {
+          knownAdminOrderIdsRef.current.add(incomingOrder.order_id);
+          playIphoneNotification3Sec();
+          showToast(
+            `🔔 New Order #${incomingOrder.id} (₹${incomingOrder.price}) • ${incomingOrder.service}`,
+          );
+        }
+      }
+      saveCachedAdminOrders(merged);
+      setAdminOrders(merged);
+    },
+    [showToast],
+  );
 
   // Sync Admin live orders + trigger 3-second iPhone notification immediately when a new order arrives
   const syncAdminOverview = useCallback(
-    async (isInitialPoll = false) => {
+    async (isInitialPoll = false, force = false) => {
       if (!isAdminLoggedIn) return;
+      if (adminSyncInFlightRef.current && !force) return;
+      adminSyncInFlightRef.current = true;
       const reqSeq = ++adminSyncSeqRef.current;
       try {
         const res = await fetch('/api/admin/overview', {
@@ -779,12 +874,14 @@ export default function App() {
         setAdminOrders(merged);
       } catch {
         // Keep cached orders visible during transient network hiccups
+      } finally {
+        adminSyncInFlightRef.current = false;
       }
     },
     [isAdminLoggedIn, showToast],
   );
 
-  // Instant Admin hydration, SSE live push, and fast 1s fallback polling
+  // Instant Admin hydration, SSE live push with full order payload, and fast non-overlapping 800ms fallback polling
   useEffect(() => {
     if (!isAdminLoggedIn) {
       knownAdminOrderIdsRef.current = null;
@@ -803,23 +900,53 @@ export default function App() {
       setAdminOrders(initialCached);
     }
 
-    void syncAdminOverview(true);
+    void syncAdminOverview(true, true);
     const timer = window.setInterval(() => {
       void syncAdminOverview(false);
-    }, 1000);
+    }, 800);
 
     let es: EventSource | null = null;
     if (typeof EventSource !== 'undefined') {
       es = new EventSource('/api/admin/events');
-      const onLiveChange = () => {
-        void syncAdminOverview(false);
+      const onNewOrder = (evt: Event) => {
+        const msgEvt = evt as MessageEvent<string>;
+        if (msgEvt.data) {
+          try {
+            const parsed = JSON.parse(msgEvt.data) as { order?: OrderItem };
+            if (parsed.order) {
+              applyLiveAdminOrderPush(parsed.order, true);
+              return;
+            }
+          } catch {
+            // Fallback to full overview fetch
+          }
+        }
+        void syncAdminOverview(false, true);
+      };
+      const onOrderUpdated = (evt: Event) => {
+        const msgEvt = evt as MessageEvent<string>;
+        if (msgEvt.data) {
+          try {
+            const parsed = JSON.parse(msgEvt.data) as { order?: OrderItem };
+            if (parsed.order) {
+              applyLiveAdminOrderPush(parsed.order, false);
+              return;
+            }
+          } catch {
+            // Fallback to full overview fetch
+          }
+        }
+        void syncAdminOverview(false, true);
+      };
+      const onOrderDeleted = () => {
+        void syncAdminOverview(false, true);
       };
       const onCatalogChange = () => {
         void syncLiveCatalog();
       };
-      es.addEventListener('new_order', onLiveChange);
-      es.addEventListener('order_updated', onLiveChange);
-      es.addEventListener('order_deleted', onLiveChange);
+      es.addEventListener('new_order', onNewOrder);
+      es.addEventListener('order_updated', onOrderUpdated);
+      es.addEventListener('order_deleted', onOrderDeleted);
       es.addEventListener('catalog_updated', onCatalogChange);
     }
 
@@ -827,7 +954,7 @@ export default function App() {
       window.clearInterval(timer);
       if (es) es.close();
     };
-  }, [isAdminLoggedIn, syncAdminOverview, syncLiveCatalog]);
+  }, [applyLiveAdminOrderPush, isAdminLoggedIn, syncAdminOverview, syncLiveCatalog]);
 
   // Cross-tab instant sync via BroadcastChannel (<10ms latency between customer & admin tabs)
   useEffect(() => {
@@ -1212,6 +1339,23 @@ export default function App() {
     });
   }, [currentCategory, pushNavState, showToast]);
 
+  const buildOrderSnapshot = (orderId: string) => {
+    const found = adminOrdersRef.current.find((o) => o.order_id === orderId);
+    if (!found) return undefined;
+    return {
+      id: found.id,
+      uid: found.uid,
+      service: found.service,
+      pack: found.pack,
+      price: found.price,
+      amount: found.amount,
+      link: found.link,
+      date: found.date,
+      createdAt: found.createdAt,
+      app: found.app,
+    };
+  };
+
   const handleAdminOrderStatus = useCallback(
     async ({
       orderId,
@@ -1227,7 +1371,7 @@ export default function App() {
       // Invalidate any in-flight poll response that started before Admin's click
       adminSyncSeqRef.current += 1;
 
-      // Lock Admin's explicit status choice immediately in persistent storage so it never reverts
+      const orderSnapshot = buildOrderSnapshot(orderId);
       const nextOverrides = {
         ...readAdminStatusOverrides(),
         [orderId]: { status, adminMessage: note, updatedAt },
@@ -1236,7 +1380,13 @@ export default function App() {
       setAdminOrders((prev) => {
         const next = prev.map((o) =>
           o.order_id === orderId
-            ? { ...o, status, adminMessage: note || o.adminMessage, statusUpdatedAt: updatedAt }
+            ? {
+                ...o,
+                status,
+                adminMessage: note || o.adminMessage,
+                statusUpdatedAt: updatedAt,
+                messageUpdatedAt: updatedAt,
+              }
             : o,
         );
         saveCachedAdminOrders(next);
@@ -1248,11 +1398,32 @@ export default function App() {
           method: 'POST',
           credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ order_id: orderId, status, note }),
+          body: JSON.stringify({ order_id: orderId, status, note, orderSnapshot }),
         });
-        if (!res.ok && res.status !== 404) {
-          showToast('Failed to update order status ❌', true);
+        const data = (await res.json().catch(() => ({}))) as {
+          ok?: boolean;
+          order?: OrderItem;
+          customerOrder?: OrderItem;
+          notification?: CustomerNotification;
+          message?: string;
+        };
+        if (!res.ok || !data.ok) {
+          showToast(data.message || 'Failed to update order status ❌', true);
           return;
+        }
+
+        const confirmedStatusTs =
+          typeof data.order?.statusUpdatedAt === 'number' ? data.order.statusUpdatedAt : updatedAt;
+        const confirmedMsg = data.order?.adminMessage ?? note;
+        saveAdminStatusOverrides({
+          ...readAdminStatusOverrides(),
+          [orderId]: { status, adminMessage: confirmedMsg, updatedAt: confirmedStatusTs },
+        });
+        if (data.order) {
+          applyLiveAdminOrderPush(data.order, false);
+        }
+        if (data.customerOrder && data.customerOrder.uid === uidRef.current) {
+          applyLiveCustomerPush({ order: data.customerOrder, notification: data.notification });
         }
 
         const label =
@@ -1263,13 +1434,13 @@ export default function App() {
               : 'Order Marked In Progress ⏳';
         showToast(label, status === 'payment_failed');
         broadcastLiveSignal('order_updated');
-        await syncAdminOverview(false);
-        await syncUserState(false);
+        void syncAdminOverview(false, true);
+        void syncUserState(false, true);
       } catch {
         showToast('Network Error ❌', true);
       }
     },
-    [showToast, syncAdminOverview, syncUserState],
+    [applyLiveAdminOrderPush, applyLiveCustomerPush, showToast, syncAdminOverview, syncUserState],
   );
 
   const handleAdminDeleteOrder = useCallback(
@@ -1309,41 +1480,64 @@ export default function App() {
   const handleAdminSendMessage = useCallback(
     async ({ orderId, message }: { orderId: string; message: string }): Promise<boolean> => {
       playClickSound();
+      adminSyncSeqRef.current += 1;
+      const orderSnapshot = buildOrderSnapshot(orderId);
       try {
         const res = await fetch('/api/admin/order-message', {
           method: 'POST',
           credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ order_id: orderId, message }),
+          body: JSON.stringify({ order_id: orderId, message, orderSnapshot }),
         });
-        const data = (await res.json()) as { ok?: boolean; message?: string };
+        const data = (await res.json().catch(() => ({}))) as {
+          ok?: boolean;
+          order?: OrderItem;
+          customerOrder?: OrderItem;
+          notification?: CustomerNotification;
+          message?: string;
+        };
         if (!res.ok || !data.ok) {
           showToast(data.message || 'Message send failed ❌', true);
           return false;
         }
+        const msgTs =
+          typeof data.order?.messageUpdatedAt === 'number'
+            ? data.order.messageUpdatedAt
+            : Date.now();
         const overrides = readAdminStatusOverrides();
         if (overrides[orderId]) {
-          overrides[orderId] = { ...overrides[orderId], adminMessage: message };
+          overrides[orderId] = {
+            ...overrides[orderId],
+            adminMessage: message,
+            updatedAt: Math.max(overrides[orderId].updatedAt, msgTs),
+          };
           saveAdminStatusOverrides(overrides);
         }
-        setAdminOrders((prev) => {
-          const next = prev.map((o) =>
-            o.order_id === orderId ? { ...o, adminMessage: message } : o,
-          );
-          saveCachedAdminOrders(next);
-          return next;
-        });
+        if (data.order) {
+          applyLiveAdminOrderPush(data.order, false);
+        } else {
+          setAdminOrders((prev) => {
+            const next = prev.map((o) =>
+              o.order_id === orderId ? { ...o, adminMessage: message, messageUpdatedAt: msgTs } : o,
+            );
+            saveCachedAdminOrders(next);
+            return next;
+          });
+        }
+        if (data.customerOrder && data.customerOrder.uid === uidRef.current) {
+          applyLiveCustomerPush({ order: data.customerOrder, notification: data.notification });
+        }
         showToast('Message Sent to Customer ✅');
         broadcastLiveSignal('order_updated');
-        await syncAdminOverview(false);
-        await syncUserState(false);
+        void syncAdminOverview(false, true);
+        void syncUserState(false, true);
         return true;
       } catch {
         showToast('Network Error ❌', true);
         return false;
       }
     },
-    [showToast, syncAdminOverview, syncUserState],
+    [applyLiveAdminOrderPush, applyLiveCustomerPush, showToast, syncAdminOverview, syncUserState],
   );
 
   const handleAdminSaveCatalog = useCallback(

@@ -48,15 +48,16 @@ export function OrdersView({ orders }: OrdersViewProps) {
                 </div>
                 {order.adminMessage && (
                   <div
-                    className={`text-[12px] font-bold mt-1 ${
+                    data-testid={`order-admin-msg-${order.order_id}`}
+                    className={`text-[12px] font-bold mt-1.5 px-2.5 py-1.5 rounded-[10px] border ${
                       order.status.toLowerCase() === 'payment_failed'
-                        ? 'text-[#c62828]'
+                        ? 'bg-[#ffebee] border-[#ffcdd2] text-[#c62828]'
                         : order.status.toLowerCase() === 'successful'
-                          ? 'text-[#2e7d32]'
-                          : 'text-[#856404]'
+                          ? 'bg-[#e8f5e9] border-[#c8e6c9] text-[#2e7d32]'
+                          : 'bg-[#fff8e1] border-[#ffe082] text-[#856404]'
                     }`}
                   >
-                    {order.adminMessage}
+                    Admin Message: {order.adminMessage}
                   </div>
                 )}
                 <div className="text-[11px] text-[#666666] mt-0.5 tabular-nums">

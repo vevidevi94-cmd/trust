@@ -208,6 +208,7 @@ export interface StoredOrder {
   date: string;
   createdAt: number;
   statusUpdatedAt?: number;
+  messageUpdatedAt?: number;
   uid: string;
   app?: string;
   paymentScreenshot: string;
@@ -904,6 +905,245 @@ export function createApiApp() {
     ]);
   }
 
+  function toAdminOrderDto(o: StoredOrder) {
+    return {
+      id: o.id,
+      order_id: o.order_id,
+      service: o.service,
+      pack: o.pack,
+      price: o.price,
+      amount: o.amount,
+      link: o.link,
+      status: o.status,
+      adminMessage: o.adminMessage,
+      date: o.date,
+      createdAt: o.createdAt,
+      statusUpdatedAt: o.statusUpdatedAt,
+      messageUpdatedAt: o.messageUpdatedAt,
+      uid: o.uid,
+      app: o.app,
+      hasPaymentScreenshot: Boolean(o.paymentScreenshot),
+      screenshotUrl: o.paymentScreenshot
+        ? `/api/admin/orders/${encodeURIComponent(o.order_id)}/screenshot`
+        : undefined,
+    };
+  }
+
+  function toCustomerOrderDto(o: StoredOrder) {
+    return {
+      id: o.id,
+      order_id: o.order_id,
+      service: o.service,
+      pack: o.pack,
+      price: o.price,
+      amount: o.amount,
+      link: o.link,
+      status: o.status,
+      adminMessage: o.adminMessage,
+      date: o.date,
+      createdAt: o.createdAt,
+      statusUpdatedAt: o.statusUpdatedAt,
+      messageUpdatedAt: o.messageUpdatedAt,
+      uid: o.uid,
+      app: o.app,
+      hasPaymentScreenshot: Boolean(o.paymentScreenshot),
+    };
+  }
+
+  function mergeRemoteOrder(remote: Partial<StoredOrder>): boolean {
+    if (!remote || typeof remote.order_id !== 'string' || !remote.order_id) return false;
+    const existing = store.orders.find((o) => o.order_id === remote.order_id);
+    if (!existing) {
+      const orderNum =
+        typeof remote.id === 'number' && Number.isFinite(remote.id)
+          ? remote.id
+          : store.orderCounter++;
+      if (orderNum >= store.orderCounter) {
+        store.orderCounter = orderNum + 1;
+      }
+      store.orders.push({
+        id: orderNum,
+        order_id: remote.order_id,
+        service: String(remote.service || 'Order'),
+        pack: String(remote.pack || ''),
+        price: Number(remote.price) || 0,
+        amount: Number(remote.amount ?? remote.price) || 0,
+        link: String(remote.link || ''),
+        status:
+          remote.status === 'successful' || remote.status === 'payment_failed'
+            ? remote.status
+            : 'pending',
+        adminMessage: typeof remote.adminMessage === 'string' ? remote.adminMessage : undefined,
+        date: String(remote.date || formatIndianDateTime(Number(remote.createdAt) || Date.now())),
+        createdAt: Number(remote.createdAt) || Date.now(),
+        statusUpdatedAt:
+          typeof remote.statusUpdatedAt === 'number' ? remote.statusUpdatedAt : undefined,
+        messageUpdatedAt:
+          typeof remote.messageUpdatedAt === 'number' ? remote.messageUpdatedAt : undefined,
+        uid: String(remote.uid || 'TRUST-0000'),
+        app: typeof remote.app === 'string' ? remote.app : 'UPI',
+        paymentScreenshot:
+          typeof remote.paymentScreenshot === 'string' ? remote.paymentScreenshot : '',
+        screenshotHash: typeof remote.screenshotHash === 'string' ? remote.screenshotHash : '',
+        hiddenFromAdmin: Boolean(remote.hiddenFromAdmin),
+      });
+      return true;
+    }
+
+    let changed = false;
+    const remStatusTs = typeof remote.statusUpdatedAt === 'number' ? remote.statusUpdatedAt : 0;
+    const curStatusTs = typeof existing.statusUpdatedAt === 'number' ? existing.statusUpdatedAt : 0;
+    if (
+      remStatusTs > curStatusTs &&
+      (remote.status === 'pending' ||
+        remote.status === 'successful' ||
+        remote.status === 'payment_failed')
+    ) {
+      existing.status = remote.status;
+      existing.statusUpdatedAt = remStatusTs;
+      changed = true;
+    }
+
+    const remMsgTs = typeof remote.messageUpdatedAt === 'number' ? remote.messageUpdatedAt : remStatusTs;
+    const curMsgTs = typeof existing.messageUpdatedAt === 'number' ? existing.messageUpdatedAt : curStatusTs;
+    if (remMsgTs > curMsgTs && typeof remote.adminMessage === 'string') {
+      existing.adminMessage = remote.adminMessage;
+      existing.messageUpdatedAt = remMsgTs;
+      changed = true;
+    }
+
+    if (remote.hiddenFromAdmin && !existing.hiddenFromAdmin) {
+      existing.hiddenFromAdmin = true;
+      changed = true;
+    }
+    return changed;
+  }
+
+  function mergeRemoteNotification(remote: Partial<StoredNotification>): boolean {
+    if (!remote || typeof remote.id !== 'string' || !remote.id || typeof remote.uid !== 'string') {
+      return false;
+    }
+    const existing = store.notifications.find((n) => n.id === remote.id);
+    if (!existing) {
+      store.notifications.push({
+        id: remote.id,
+        uid: remote.uid,
+        orderId: String(remote.orderId || ''),
+        orderNum: Number(remote.orderNum) || 0,
+        service: String(remote.service || ''),
+        pack: String(remote.pack || ''),
+        status:
+          remote.status === 'successful' || remote.status === 'payment_failed'
+            ? remote.status
+            : 'pending',
+        message: String(remote.message || ''),
+        date: String(remote.date || formatIndianDateTime(Number(remote.createdAt) || Date.now())),
+        createdAt: Number(remote.createdAt) || Date.now(),
+        read: Boolean(remote.read),
+      });
+      return true;
+    }
+    if (remote.read && !existing.read) {
+      existing.read = true;
+      return true;
+    }
+    return false;
+  }
+
+  let lastRemoteOrdersSyncMs = 0;
+  async function syncOrdersFromRemoteIfStale(): Promise<void> {
+    const hasKv = Boolean(KV_REST_API_URL && KV_REST_API_TOKEN);
+    const hasFb = Date.now() >= firebaseBlockedUntilMs;
+    if (!hasKv && !hasFb) return;
+    const now = Date.now();
+    if (now - lastRemoteOrdersSyncMs < 1000) return;
+    lastRemoteOrdersSyncMs = now;
+
+    const [kvOrders, kvNotifs, fbOrders, fbNotifs] = await Promise.all([
+      hasKv ? readFromKv<StoredOrder[]>('tp:orders:list') : Promise.resolve(null),
+      hasKv ? readFromKv<StoredNotification[]>('tp:notifs:list') : Promise.resolve(null),
+      hasFb ? readFromFirebase<Record<string, Partial<StoredOrder>>>('orders') : Promise.resolve(null),
+      hasFb
+        ? readFromFirebase<Record<string, Record<string, Partial<StoredNotification>>>>('notifications')
+        : Promise.resolve(null),
+    ]);
+
+    let changed = false;
+    if (Array.isArray(kvOrders)) {
+      for (const o of kvOrders) {
+        if (mergeRemoteOrder(o)) changed = true;
+      }
+    }
+    if (fbOrders && typeof fbOrders === 'object') {
+      for (const o of Object.values(fbOrders)) {
+        if (mergeRemoteOrder(o)) changed = true;
+      }
+    }
+    if (Array.isArray(kvNotifs)) {
+      for (const n of kvNotifs) {
+        if (mergeRemoteNotification(n)) changed = true;
+      }
+    }
+    if (fbNotifs && typeof fbNotifs === 'object') {
+      for (const byUser of Object.values(fbNotifs)) {
+        if (!byUser || typeof byUser !== 'object') continue;
+        for (const n of Object.values(byUser)) {
+          if (mergeRemoteNotification(n)) changed = true;
+        }
+      }
+    }
+
+    if (changed) {
+      store.orders.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0) || b.id - a.id);
+      store.notifications.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+      saveStore(store);
+    }
+  }
+
+  async function persistOrderAndNotifRemote(
+    order: StoredOrder,
+    notif?: StoredNotification,
+  ): Promise<void> {
+    const tasks: Promise<void>[] = [];
+    const lightOrderForRemote = {
+      id: order.id,
+      order_id: order.order_id,
+      service: order.service,
+      pack: order.pack,
+      price: order.price,
+      amount: order.amount,
+      link: order.link,
+      status: order.status,
+      adminMessage: order.adminMessage,
+      date: order.date,
+      createdAt: order.createdAt,
+      statusUpdatedAt: order.statusUpdatedAt,
+      messageUpdatedAt: order.messageUpdatedAt,
+      uid: order.uid,
+      app: order.app,
+      hiddenFromAdmin: order.hiddenFromAdmin,
+    };
+    tasks.push(syncToFirebase(`orders/${order.order_id}`, lightOrderForRemote));
+    if (notif) {
+      tasks.push(syncToFirebase(`notifications/${notif.uid}/${notif.id}`, notif));
+    }
+    if (KV_REST_API_URL && KV_REST_API_TOKEN) {
+      tasks.push(
+        writeToKv(
+          'tp:orders:list',
+          store.orders.slice(0, 120).map((o) => ({
+            ...o,
+            paymentScreenshot: o.paymentScreenshot ? '' : '',
+          })),
+        ),
+      );
+      if (notif) {
+        tasks.push(writeToKv('tp:notifs:list', store.notifications.slice(0, 200)));
+      }
+    }
+    await Promise.all(tasks);
+  }
+
   function makeCatalogToken(): string | null {
     if (!store.catalogUpdatedAt) return null;
     return signToken({
@@ -1006,28 +1246,13 @@ export function createApiApp() {
   });
 
   // Customer's own persistent state (orders + live notifications from admin)
-  app.get('/api/user-state', (req, res) => {
+  app.get('/api/user-state', async (req, res) => {
+    await syncOrdersFromRemoteIfStale();
     const session = getOrIssueUserSession(req, res, store);
 
     const orders = store.orders
       .filter((o) => o.uid === session.uid)
-      .map((o) => ({
-        id: o.id,
-        order_id: o.order_id,
-        service: o.service,
-        pack: o.pack,
-        price: o.price,
-        amount: o.amount,
-        link: o.link,
-        status: o.status,
-        adminMessage: o.adminMessage,
-        date: o.date,
-        createdAt: o.createdAt,
-        statusUpdatedAt: o.statusUpdatedAt,
-        uid: o.uid,
-        app: o.app,
-        hasPaymentScreenshot: Boolean(o.paymentScreenshot),
-      }));
+      .map(toCustomerOrderDto);
 
     const notifications = store.notifications
       .filter((n) => n.uid === session.uid)
@@ -1237,42 +1462,20 @@ export function createApiApp() {
 
     store.orders.unshift(savedOrder);
     saveStore(store);
+    const adminDto = toAdminOrderDto(savedOrder);
+    const customerDto = toCustomerOrderDto(savedOrder);
     broadcastToAdmins('new_order', {
+      order: adminDto,
       order_id: savedOrder.order_id,
       id: savedOrder.id,
       service: savedOrder.service,
       price: savedOrder.price,
     });
-    void syncToFirebase(`orders/${savedOrder.order_id}`, {
-      id: savedOrder.id,
-      order_id: savedOrder.order_id,
-      service: savedOrder.service,
-      pack: savedOrder.pack,
-      price: savedOrder.price,
-      link: savedOrder.link,
-      status: savedOrder.status,
-      date: savedOrder.date,
-      createdAt: savedOrder.createdAt,
-      uid: savedOrder.uid,
-    });
+    await persistOrderAndNotifRemote(savedOrder);
 
     res.json({
       ok: true,
-      order: {
-        id: savedOrder.id,
-        order_id: savedOrder.order_id,
-        service: savedOrder.service,
-        pack: savedOrder.pack,
-        price: savedOrder.price,
-        amount: savedOrder.amount,
-        link: savedOrder.link,
-        status: savedOrder.status,
-        date: savedOrder.date,
-        createdAt: savedOrder.createdAt,
-        uid: savedOrder.uid,
-        app: savedOrder.app,
-        hasPaymentScreenshot: true,
-      },
+      order: customerDto,
     });
   });
 
@@ -1314,18 +1517,83 @@ export function createApiApp() {
     res.json({ ok: true });
   });
 
-  // Live Admin orders list — orders stay permanently until Admin explicitly deletes them
-  app.get('/api/admin/overview', (req, res) => {
+  // Live Admin orders list — lightweight payload (screenshots served separately & cached)
+  app.get('/api/admin/overview', async (req, res) => {
     if (!isAdminAuthenticated(req)) {
       res.status(401).json({ ok: false, message: 'Unauthorized' });
       return;
     }
-    const visibleOrders = store.orders.filter((o) => !o.hiddenFromAdmin);
+    await syncOrdersFromRemoteIfStale();
+    const visibleOrders = store.orders
+      .filter((o) => !o.hiddenFromAdmin)
+      .map(toAdminOrderDto);
     res.json({
       ok: true,
       orders: visibleOrders,
     });
   });
+
+  // Admin-only cached binary endpoint for order payment screenshots (keeps live overview blazingly fast)
+  app.get('/api/admin/orders/:orderId/screenshot', (req, res) => {
+    if (!isAdminAuthenticated(req)) {
+      res.status(401).send('Unauthorized');
+      return;
+    }
+    const orderId = String(req.params.orderId || '').trim();
+    const target = store.orders.find((o) => o.order_id === orderId);
+    if (!target || !target.paymentScreenshot) {
+      res.status(404).send('Not found');
+      return;
+    }
+    const match = /^data:image\/(png|jpeg|jpg|webp);base64,([A-Za-z0-9+/=]+)$/i.exec(
+      target.paymentScreenshot.trim(),
+    );
+    if (!match) {
+      res.status(404).send('Not found');
+      return;
+    }
+    const mime = match[1].toLowerCase() === 'jpg' ? 'image/jpeg' : `image/${match[1].toLowerCase()}`;
+    const buf = Buffer.from(match[2], 'base64');
+    res.setHeader('Content-Type', mime);
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    res.setHeader('Content-Disposition', 'inline');
+    res.send(buf);
+  });
+
+  function resolveOrHydrateAdminOrder(
+    orderId: string,
+    snapshot?: Record<string, unknown>,
+  ): StoredOrder | null {
+    const found = store.orders.find((o) => o.order_id === orderId);
+    if (found) return found;
+    if (!snapshot || typeof snapshot !== 'object') return null;
+    const uid = typeof snapshot.uid === 'string' && snapshot.uid ? snapshot.uid : '';
+    if (!uid) return null;
+    const idNum =
+      typeof snapshot.id === 'number' && Number.isFinite(snapshot.id)
+        ? snapshot.id
+        : store.orderCounter++;
+    if (idNum >= store.orderCounter) store.orderCounter = idNum + 1;
+    const hydrated: StoredOrder = {
+      id: idNum,
+      order_id: orderId,
+      service: String(snapshot.service || 'Order'),
+      pack: String(snapshot.pack || ''),
+      price: Number(snapshot.price) || 0,
+      amount: Number(snapshot.amount ?? snapshot.price) || 0,
+      link: String(snapshot.link || ''),
+      status: 'pending',
+      date: String(snapshot.date || formatIndianDateTime(Date.now())),
+      createdAt: Number(snapshot.createdAt) || Date.now(),
+      uid,
+      app: typeof snapshot.app === 'string' ? snapshot.app : 'UPI',
+      paymentScreenshot: '',
+      screenshotHash: '',
+      hiddenFromAdmin: false,
+    };
+    store.orders.unshift(hydrated);
+    return hydrated;
+  }
 
   // Admin updates order status (Successful / In Progress / Payment Failed) & pushes customer bell notification
   app.post('/api/admin/order-status', async (req, res) => {
@@ -1334,6 +1602,7 @@ export function createApiApp() {
       return;
     }
 
+    await syncOrdersFromRemoteIfStale();
     const orderId = String(req.body?.order_id || '').trim();
     const rawStatus = String(req.body?.status || '').trim().toLowerCase();
     const note = String(req.body?.note || '').trim().slice(0, 200);
@@ -1350,7 +1619,7 @@ export function createApiApp() {
       return;
     }
 
-    const target = store.orders.find((o) => o.order_id === orderId);
+    const target = resolveOrHydrateAdminOrder(orderId, req.body?.orderSnapshot);
     if (!target) {
       res.status(404).json({ ok: false, message: 'Order not found' });
       return;
@@ -1363,10 +1632,15 @@ export function createApiApp() {
           ? `Order #${target.id} Payment Failed ❌`
           : `Order #${target.id} is In Progress ⏳`;
 
-    const now = Date.now();
+    const now = Math.max(
+      Date.now(),
+      (target.statusUpdatedAt || 0) + 1,
+      (target.messageUpdatedAt || 0) + 1,
+    );
     target.status = normalizedStatus;
     target.adminMessage = note || defaultMsg;
     target.statusUpdatedAt = now;
+    target.messageUpdatedAt = now;
 
     const notif: StoredNotification = {
       id: `NOTIF_${now}_${crypto.randomInt(100, 999)}`,
@@ -1385,29 +1659,30 @@ export function createApiApp() {
     store.notifications.unshift(notif);
     saveStore(store);
 
+    const adminDto = toAdminOrderDto(target);
+    const customerDto = toCustomerOrderDto(target);
+
     broadcastToAdmins('order_updated', {
+      order: adminDto,
       order_id: target.order_id,
       status: target.status,
     });
     broadcastToUser(target.uid, 'notification', {
+      order: customerDto,
+      notification: notif,
       id: notif.id,
       orderId: target.order_id,
       status: target.status,
       message: notif.message,
     });
 
-    void syncToFirebase(`orders/${target.order_id}`, {
-      order_id: target.order_id,
-      status: target.status,
-      adminMessage: target.adminMessage,
-    });
-    void syncToFirebase(`notifications/${target.uid}/${notif.id}`, notif);
+    await persistOrderAndNotifRemote(target, notif);
 
-    res.json({ ok: true, order: target, notification: notif });
+    res.json({ ok: true, order: adminDto, customerOrder: customerDto, notification: notif });
   });
 
   // Admin explicitly deletes an order notification from Admin Panel (idempotent)
-  app.delete('/api/admin/orders/:orderId', (req, res) => {
+  app.delete('/api/admin/orders/:orderId', async (req, res) => {
     if (!isAdminAuthenticated(req)) {
       res.status(401).json({ ok: false, message: 'Unauthorized' });
       return;
@@ -1418,6 +1693,7 @@ export function createApiApp() {
     if (target) {
       target.hiddenFromAdmin = true;
       saveStore(store);
+      await persistOrderAndNotifRemote(target);
     }
 
     broadcastToAdmins('order_deleted', { order_id: orderId });
@@ -1425,12 +1701,13 @@ export function createApiApp() {
   });
 
   // Admin sends a direct message to customer on an order without changing its current status
-  app.post('/api/admin/order-message', (req, res) => {
+  app.post('/api/admin/order-message', async (req, res) => {
     if (!isAdminAuthenticated(req)) {
       res.status(401).json({ ok: false, message: 'Unauthorized' });
       return;
     }
 
+    await syncOrdersFromRemoteIfStale();
     const orderId = String(req.body?.order_id || '').trim();
     const message = String(req.body?.message || '').trim().slice(0, 200);
     if (!message) {
@@ -1438,14 +1715,19 @@ export function createApiApp() {
       return;
     }
 
-    const target = store.orders.find((o) => o.order_id === orderId);
+    const target = resolveOrHydrateAdminOrder(orderId, req.body?.orderSnapshot);
     if (!target) {
       res.status(404).json({ ok: false, message: 'Order not found' });
       return;
     }
 
-    const now = Date.now();
+    const now = Math.max(
+      Date.now(),
+      (target.messageUpdatedAt || 0) + 1,
+      (target.statusUpdatedAt || 0) + 1,
+    );
     target.adminMessage = message;
+    target.messageUpdatedAt = now;
 
     const notif: StoredNotification = {
       id: `NOTIF_${now}_${crypto.randomInt(100, 999)}`,
@@ -1464,22 +1746,27 @@ export function createApiApp() {
     store.notifications.unshift(notif);
     saveStore(store);
 
+    const adminDto = toAdminOrderDto(target);
+    const customerDto = toCustomerOrderDto(target);
+
     broadcastToAdmins('order_updated', {
+      order: adminDto,
       order_id: target.order_id,
       status: target.status,
       adminMessage: target.adminMessage,
     });
     broadcastToUser(target.uid, 'notification', {
+      order: customerDto,
+      notification: notif,
       id: notif.id,
       orderId: target.order_id,
       status: target.status,
       message: notif.message,
     });
 
-    void syncToFirebase(`orders/${target.order_id}/adminMessage`, target.adminMessage);
-    void syncToFirebase(`notifications/${target.uid}/${notif.id}`, notif);
+    await persistOrderAndNotifRemote(target, notif);
 
-    res.json({ ok: true, order: target, notification: notif });
+    res.json({ ok: true, order: adminDto, customerOrder: customerDto, notification: notif });
   });
 
   // Admin edits live service names, packages & prices (auto-updates scanner amount too)

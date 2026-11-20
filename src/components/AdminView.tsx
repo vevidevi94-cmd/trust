@@ -257,34 +257,39 @@ export function AdminView({
                   </button>
                 </div>
 
-                {order.paymentScreenshot && (
-                  <div className="mt-2 bg-[#f8f5ff] border border-[#e9dffc] rounded-[12px] p-2">
-                    <div className="flex items-center justify-between mb-1.5">
-                      <span className="text-[12px] font-extrabold text-[#3a1d6d]">
-                        Payment Screenshot:
-                      </span>
+                {(() => {
+                  const screenshotSrc = order.paymentScreenshot || order.screenshotUrl;
+                  if (!screenshotSrc) return null;
+                  return (
+                    <div className="mt-2 bg-[#f8f5ff] border border-[#e9dffc] rounded-[12px] p-2">
+                      <div className="flex items-center justify-between mb-1.5">
+                        <span className="text-[12px] font-extrabold text-[#3a1d6d]">
+                          Payment Screenshot:
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => setPreviewImg(screenshotSrc)}
+                          className="text-[11px] font-bold text-[#7c4dff] inline-flex items-center gap-1 cursor-pointer"
+                        >
+                          <Eye className="w-3.5 h-3.5" />
+                          <span>View Full</span>
+                        </button>
+                      </div>
                       <button
                         type="button"
-                        onClick={() => setPreviewImg(order.paymentScreenshot!)}
-                        className="text-[11px] font-bold text-[#7c4dff] inline-flex items-center gap-1 cursor-pointer"
+                        onClick={() => setPreviewImg(screenshotSrc)}
+                        className="w-full block cursor-pointer"
                       >
-                        <Eye className="w-3.5 h-3.5" />
-                        <span>View Full</span>
+                        <img
+                          src={screenshotSrc}
+                          alt={`Payment screenshot for order #${order.id}`}
+                          loading="lazy"
+                          className="w-full max-h-44 object-contain rounded-[8px] bg-white border border-[#e9dffc]"
+                        />
                       </button>
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => setPreviewImg(order.paymentScreenshot!)}
-                      className="w-full block cursor-pointer"
-                    >
-                      <img
-                        src={order.paymentScreenshot}
-                        alt={`Payment screenshot for order #${order.id}`}
-                        className="w-full max-h-44 object-contain rounded-[8px] bg-white border border-[#e9dffc]"
-                      />
-                    </button>
-                  </div>
-                )}
+                  );
+                })()}
 
                 <div className="text-[11px] text-[#666] mt-1.5 tabular-nums">
                   {order.createdAt ? formatIndianDateTime(order.createdAt) : order.date} | {order.order_id}
